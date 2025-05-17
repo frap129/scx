@@ -15,7 +15,6 @@ use log::info;
 use nix::unistd::Pid;
 
 use std::panic;
-use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -37,6 +36,22 @@ pub struct RandomDelayArgs {
     /// Maximum time to add for random delay.
     #[clap(long, requires = "random_delay_frequency")]
     pub random_delay_max_us: Option<u64>,
+}
+
+/// Randomly CPU frequency scale a process.
+#[derive(Debug, Parser)]
+pub struct CpuFreqArgs {
+    /// Chance of randomly delaying a process.
+    #[clap(long, requires = "cpufreq_max")]
+    pub cpufreq_frequency: Option<f64>,
+
+    /// Minimum CPU frequency for scaling.
+    #[clap(long, requires = "cpufreq_frequency")]
+    pub cpufreq_min: Option<u32>,
+
+    /// Minimum CPU frequency for scaling.
+    #[clap(long, requires = "cpufreq_min")]
+    pub cpufreq_max: Option<u32>,
 }
 
 /// scx_chaos: A general purpose sched_ext scheduler designed to amplify race conditions
@@ -76,6 +91,9 @@ pub struct Args {
 
     #[command(flatten, next_help_heading = "Random Delays")]
     pub random_delay: RandomDelayArgs,
+
+    #[command(flatten, next_help_heading = "CPU Frequency")]
+    pub cpu_freq: CpuFreqArgs,
 
     #[command(flatten, next_help_heading = "General Scheduling")]
     pub p2dq: P2dqOpts,
@@ -133,6 +151,18 @@ impl<'a> Iterator for BuilderIterator<'a> {
                     frequency,
                     min_us,
                     max_us,
+                });
+            };
+            if let CpuFreqArgs {
+                cpufreq_frequency: Some(frequency),
+                cpufreq_min: Some(min_freq),
+                cpufreq_max: Some(max_freq),
+            } = self.args.cpu_freq
+            {
+                traits.push(Trait::CpuFreq {
+                    frequency,
+                    min_freq,
+                    max_freq,
                 });
             };
 
@@ -202,7 +232,7 @@ fn main() -> Result<()> {
             for builder in BuilderIterator::from(&*args) {
                 info!("{:?}", &builder);
 
-                let sched: Pin<Box<Scheduler>> = builder.try_into()?;
+                let sched: Scheduler = builder.try_into()?;
 
                 sched.observe(&shutdown, None)?;
             }
@@ -250,10 +280,9 @@ fn main() -> Result<()> {
         cvar.notify_all();
     }
 
-    match scheduler_thread.join() {
-        Ok(_) => {}
-        Err(e) => panic::resume_unwind(e),
-    };
+    if let Err(e) = scheduler_thread.join() {
+        panic::resume_unwind(e);
+    }
 
     Ok(())
 }

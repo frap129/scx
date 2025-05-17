@@ -71,24 +71,42 @@ use stats::SysStats;
 /// See the more detailed overview of the LAVD design at main.bpf.c.
 #[derive(Debug, Parser)]
 struct Opts {
-    /// Automatically decide the scheduler's power mode based on system load.
-    /// This is a default mode if you don't specify the following options:
+    /// Automatically decide the scheduler's power mode (performance vs.
+    /// powersave vs. balanced), CPU preference order, etc, based on system
+    /// load. The options affecting the power mode and the use of core compaction
+    /// (--autopower, --performance, --powersave, --balanced,
+    /// --no-core-compaction) cannot be used with this option. When no option
+    /// is specified, this is a default mode.
     #[clap(long = "autopilot", action = clap::ArgAction::SetTrue)]
     autopilot: bool,
 
-    /// Automatically decide the scheduler's power mode based on the system's active power profile.
+    /// Automatically decide the scheduler's power mode (performance vs.
+    /// powersave vs. balanced) based on the system's active power profile.
+    /// The scheduler's power mode decides the CPU preference order and the use
+    /// of core compaction, so the options affecting these (--autopilot,
+    /// --performance, --powersave, --balanced, --no-core-compaction) cannot
+    /// be used with this option.
     #[clap(long = "autopower", action = clap::ArgAction::SetTrue)]
     autopower: bool,
 
-    /// Run in performance mode to get maximum performance.
+    /// Run the scheduler in performance mode to get maximum performance.
+    /// This option cannot be used with other conflicting options (--autopilot,
+    /// --autopower, --balanced, --powersave, --no-core-compaction)
+    /// affecting the use of core compaction.
     #[clap(long = "performance", action = clap::ArgAction::SetTrue)]
     performance: bool,
 
-    /// Run in powersave mode to minimize power consumption.
+    /// Run the scheduler in powersave mode to minimize powr consumption.
+    /// This option cannot be used with other conflicting options (--autopilot,
+    /// --autopower, --performance, --balanced, --no-core-compaction)
+    /// affecting the use of core compaction.
     #[clap(long = "powersave", action = clap::ArgAction::SetTrue)]
     powersave: bool,
 
-    /// Run in balanced mode aiming for sweetspot between power and performance (default).
+    /// Run the scheduler in balanced mode aiming for sweetspot between power
+    /// and performance. This option cannot be used with other conflicting
+    /// options (--autopilot, --autopower, --performance, --powersave,
+    /// --no-core-compaction) affecting the use of core compaction.
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
 
@@ -97,10 +115,13 @@ struct Opts {
     slice_max_us: u64,
 
     /// Minimum scheduling slice duration in microseconds.
-    #[clap(long = "slice-min-us", default_value = "300")]
+    #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
-    /// List of CPUs in preferred order (e.g., "0-3,7,6,5,4").
+    /// List of CPUs in preferred order (e.g., "0-3,7,6,5,4"). The scheduler
+    /// uses the CPU preference mode only when the core compaction is enabled
+    /// (i.e., balanced or powersave mode is specified as an option or chosen
+    /// in the autopilot or autopower mode).
     #[clap(long = "cpu-pref-order", default_value = "")]
     cpu_pref_order: String,
 
@@ -116,32 +137,18 @@ struct Opts {
     #[clap(long = "no-wake-sync", action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
-    /// Disable core compaction and schedule tasks across all online CPUs. Core compaction attempts
-    /// to keep idle CPUs idle in favor of scheduling tasks on CPUs that are already
-    /// awake. See main.bpf.c for more info. Normally set by the power mode, but can be set independently if
-    /// desired.
+    /// Disable core compaction so the scheduler uses all the online CPUs.
+    /// The core compaction attempts to minimize the number of actively used
+    /// CPUs for unaffinitized tasks, respecting the CPU preference order.
+    /// Normally, the core compaction is enabled by the power mode (i.e.,
+    /// balanced or powersave mode is specified as an option or chosen in
+    /// the autopilot or autopower mode). This option cannot be used with the
+    /// other options that control the core compaction (--autopilot,
+    /// --autopower, --performance, --balanced, --powersave).
     #[clap(long = "no-core-compaction", action = clap::ArgAction::SetTrue)]
     no_core_compaction: bool,
 
-    /// Schedule tasks on SMT siblings before using other physcial cores when core compaction is
-    /// enabled. Normally set by the power mode, but can be set independently if desired.
-    #[clap(long = "prefer-smt-core", action = clap::ArgAction::SetTrue)]
-    prefer_smt_core: bool,
-
-    /// Schedule tasks on little (efficiency) cores before big (performance) cores when core compaction is
-    /// enabled. Normally set by the power mode, but can be set independently if desired.
-    #[clap(long = "prefer-little-core", action = clap::ArgAction::SetTrue)]
-    prefer_little_core: bool,
-
-    /// Do not specifically prefer to schedule on turbo cores. Normally set by the power mode, but
-    /// can be set independently if desired.
-    #[clap(long = "no-prefer-turbo-core", action = clap::ArgAction::SetTrue)]
-    no_prefer_turbo_core: bool,
-
-    /// Disable controlling the CPU frequency. In order to improve latency and responsiveness of
-    /// performance-critical tasks, scx_lavd increases the CPU frequency even if CPU usage is low.
-    /// See main.bpf.c for more info. Normally set by the power mode, but can be set independently
-    /// if desired.
+    /// Disable controlling the CPU frequency.
     #[clap(long = "no-freq-scaling", action = clap::ArgAction::SetTrue)]
     no_freq_scaling: bool,
 
@@ -173,47 +180,95 @@ struct Opts {
 }
 
 impl Opts {
-    fn autopilot_allowed(&self) -> bool {
+    fn can_autopilot(&self) -> bool {
+        self.autopower == false
+            && self.performance == false
+            && self.powersave == false
+            && self.balanced == false
+            && self.no_core_compaction == false
+    }
+
+    fn can_autopower(&self) -> bool {
+        self.autopilot == false
+            && self.performance == false
+            && self.powersave == false
+            && self.balanced == false
+            && self.no_core_compaction == false
+    }
+
+    fn can_performance(&self) -> bool {
+        self.autopilot == false
+            && self.autopower == false
+            && self.powersave == false
+            && self.balanced == false
+    }
+
+    fn can_balanced(&self) -> bool {
         self.autopilot == false
             && self.autopower == false
             && self.performance == false
             && self.powersave == false
-            && self.balanced == false
-            && self.cpu_pref_order == ""
             && self.no_core_compaction == false
-            && self.prefer_smt_core == false
-            && self.prefer_little_core == false
-            && self.no_prefer_turbo_core == false
-            && self.no_freq_scaling == false
-            && self.monitor == None
-            && self.monitor_sched_samples == None
+    }
+
+    fn can_powersave(&self) -> bool {
+        self.autopilot == false
+            && self.autopower == false
+            && self.performance == false
+            && self.balanced == false
+            && self.no_core_compaction == false
     }
 
     fn proc(&mut self) -> Option<&mut Self> {
-        if self.autopilot_allowed() {
-            self.autopilot = true;
-            info!("Autopilot mode is enabled by default.");
+        if !self.autopilot {
+            self.autopilot = self.can_autopilot();
+        }
+        if self.autopilot {
+            if !self.can_autopilot() {
+                info!("Autopilot mode cannot be used with conflicting options.");
+                return None;
+            }
+            info!("Autopilot mode is enabled.");
+            return Some(self);
+        }
+
+        if self.autopower {
+            if !self.can_autopower() {
+                info!("Autopower mode cannot be used with conflicting options.");
+                return None;
+            }
+            info!("Autopower mode is enabled.");
             return Some(self);
         }
 
         if self.performance {
+            if !self.can_performance() {
+                info!("Performance mode cannot be used with conflicting options.");
+                return None;
+            }
+            info!("Performance mode is enabled.");
             self.no_core_compaction = true;
-            self.prefer_smt_core = false;
-            self.prefer_little_core = false;
-            self.no_prefer_turbo_core = false;
-            self.no_freq_scaling = true;
-        } else if self.powersave {
+            return Some(self);
+        }
+
+        if self.powersave {
+            if !self.can_powersave() {
+                info!("Powersave mode cannot be used with conflicting options.");
+                return None;
+            }
+            info!("Powersave mode is enabled.");
             self.no_core_compaction = false;
-            self.prefer_smt_core = true;
-            self.prefer_little_core = true;
-            self.no_prefer_turbo_core = true;
-            self.no_freq_scaling = false;
-        } else if self.balanced {
+            return Some(self);
+        }
+
+        if self.balanced {
+            if !self.can_balanced() {
+                info!("Balanced mode cannot be used with conflicting options.");
+                return None;
+            }
+            info!("Balanced mode is enabled.");
             self.no_core_compaction = false;
-            self.prefer_smt_core = false;
-            self.prefer_little_core = false;
-            self.no_prefer_turbo_core = false;
-            self.no_freq_scaling = false;
+            return Some(self);
         }
 
         Some(self)
@@ -408,6 +463,7 @@ impl FlatTopology {
         // are under the same node and LLC and have the same core type.
         let mut cpdom_id = 0;
         let mut cpdom_map: BTreeMap<ComputeDomainKey, ComputeDomainValue> = BTreeMap::new();
+        let mut cpdom_types: BTreeMap<usize, bool> = BTreeMap::new();
         for cpu_fid in cpu_fids.iter() {
             let key = ComputeDomainKey {
                 node_id: cpu_fid.node_id,
@@ -426,23 +482,13 @@ impl FlatTopology {
                         cpu_ids: Vec::new(),
                         neighbor_map: RefCell::new(BTreeMap::new()),
                     };
+                    cpdom_types.insert(cpdom_id, key.is_big);
+
                     cpdom_id += 1;
                 }
             }
             value.cpu_ids.push(cpu_fid.cpu_id);
             cpdom_map.insert(key, value);
-        }
-
-        // Fill up cpdom_alt_id for each compute domain, where the alternative
-        // compute domain is a compute domain that are under the same node
-        // and LLC but has a different core type.
-        for (k, v) in cpdom_map.iter() {
-            let mut key = k.clone();
-            key.is_big = !k.is_big;
-
-            if let Some(alt_v) = cpdom_map.get(&key) {
-                v.cpdom_alt_id.set(alt_v.cpdom_id);
-            }
         }
 
         // Build a neighbor map for each compute domain, where neighbors are
@@ -460,6 +506,35 @@ impl FlatTopology {
                 }
                 None => {
                     map.insert(d, RefCell::new(vec![to_v.cpdom_id]));
+                }
+            }
+        }
+
+        // Fill up cpdom_alt_id for each compute domain.
+        for (k, v) in cpdom_map.iter() {
+            let mut key = k.clone();
+            key.is_big = !k.is_big;
+
+            if let Some(alt_v) = cpdom_map.get(&key) {
+                // First, try to find an alternative domain
+                // under the same node/LLC.
+                v.cpdom_alt_id.set(alt_v.cpdom_id);
+            } else {
+                // If there is no alternative domain in the same node/LLC,
+                // choose the closest one.
+                //
+                // Note that currently, the idle CPU selection (pick_idle_cpu)
+                // is not optimized for this kind of architecture, where big
+                // and LITTLE cores are in different node/LLCs.
+                'outer: for (_dist, ncpdoms) in v.neighbor_map.borrow().iter() {
+                    for ncpdom_id in ncpdoms.borrow().iter() {
+                        if let Some(is_big) = cpdom_types.get(ncpdom_id) {
+                            if *is_big == key.is_big {
+                                v.cpdom_alt_id.set(*ncpdom_id);
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -609,8 +684,12 @@ impl<'a> Scheduler<'a> {
         for (pos, cpu) in cpu_ps_order.iter().enumerate() {
             skel.maps.rodata_data.cpu_order_powersave[pos] = *cpu as u16;
         }
-        info!("CPU pref order in performance mode: {:?}", cpu_pf_order);
-        info!("CPU pref order in powersave mode: {:?}", cpu_ps_order);
+        if !opts.powersave {
+            info!("CPU pref order in performance mode: {:?}", cpu_pf_order);
+        }
+        if !opts.performance {
+            info!("CPU pref order in powersave mode: {:?}", cpu_ps_order);
+        }
 
         // Initialize compute domain contexts
         for (k, v) in topo.cpdom_map.iter() {
@@ -642,17 +721,12 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn is_powersave_mode(opts: &Opts) -> bool {
-        opts.prefer_smt_core && opts.prefer_little_core
-    }
-
     fn init_globals(skel: &mut OpenBpfSkel, opts: &Opts, topo: &FlatTopology) {
         skel.maps.bss_data.no_preemption = opts.no_preemption;
         skel.maps.bss_data.no_wake_sync = opts.no_wake_sync;
         skel.maps.bss_data.no_core_compaction = opts.no_core_compaction;
         skel.maps.bss_data.no_freq_scaling = opts.no_freq_scaling;
-        skel.maps.bss_data.no_prefer_turbo_core = opts.no_prefer_turbo_core;
-        skel.maps.bss_data.is_powersave_mode = Self::is_powersave_mode(&opts);
+        skel.maps.bss_data.is_powersave_mode = opts.powersave;
         skel.maps.rodata_data.nr_cpu_ids = *NR_CPU_IDS as u64;
         skel.maps.rodata_data.is_smt_active = topo.smt_enabled;
         skel.maps.rodata_data.is_autopilot_on = opts.autopilot;
@@ -962,7 +1036,7 @@ fn main() -> Result<()> {
     init_log(&opts);
 
     opts.proc().unwrap();
-    debug!("{:#?}", opts);
+    info!("{:#?}", opts);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();

@@ -3,6 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use std::io::{self, ErrorKind};
 use std::mem::MaybeUninit;
 
 use crate::bpf_intf;
@@ -69,7 +70,6 @@ pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
 ///
 /// Finally the methods exited() and shutdown_and_report() can be used respectively to test
 /// whether the BPF component exited, and to shutdown and report the exit message.
-/// whether the BPF component exited, and to shutdown and report exit message.
 
 // Task queued for scheduling from the BPF component (see bpf_intf::queued_task_ctx).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone)]
@@ -356,10 +356,15 @@ impl<'cb> BpfScheduler<'cb> {
         for (_cache_id, cpus) in cache_id_map {
             for cpu in &cpus {
                 for sibling_cpu in &cpus {
-                    match enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu) {
-                        Ok(()) => {}
-                        Err(_) => {}
-                    }
+                    enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu).map_err(|e| {
+                        io::Error::new(
+                            ErrorKind::Other,
+                            format!(
+                                "enable_sibling_cpu_fn failed for cpu {} sibling {}: err {}",
+                                cpu, sibling_cpu, e
+                            ),
+                        )
+                    })?;
                 }
             }
         }

@@ -127,10 +127,10 @@ static void do_core_compaction(void)
 {
 	const volatile u16 *cpu_order = get_cpu_order();
 	struct cpu_ctx *cpuc;
-	struct bpf_cpumask *active, *ovrflw, *cd_cpumask;
+	struct bpf_cpumask *active, *ovrflw;
 	struct cpdom_ctx *cpdomc;
 	int nr_active, nr_active_old, cpu, i;
-	u32 sum_capacity = 0, big_capacity = 0;
+	u32 sum_capacity = 0, big_capacity = 0, nr_active_cpdoms = 0;
 	bool clear;
 	u64 cpdom_id;
 
@@ -172,11 +172,17 @@ static void do_core_compaction(void)
 		if (i < nr_active) {
 			bpf_cpumask_set_cpu(cpu, active);
 			bpf_cpumask_clear_cpu(cpu, ovrflw);
-
-			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpu]);
-			if (cpdomc)
-				WRITE_ONCE(cpdomc->is_active, true);
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+			/*
+			 * Accumulate the capacity of active CPUs and
+			 * increase the number of active CPUs.
+			 */
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+			if (cpdomc) {
+				cpdomc->cap_sum_temp += cpuc->capacity;
+				cpdomc->nr_acpus_temp++;
+			}
 
 			/*
 			 * Calculate big capacity ratio among active cores.
@@ -213,20 +219,24 @@ static void do_core_compaction(void)
 	sys_stat.nr_active = nr_active;
 
 	/*
-	 * Maintain cpdomc->is_active reflecting the active set.
+	 * Update nr_active_cpus and cap_sum_active_cpus.
 	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
 
 		cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-		cd_cpumask = MEMBER_VPTR(cpdom_cpumask, [cpdom_id]);
-		if (!cpdomc || !cd_cpumask || !cpdomc->is_active)
+		if (!cpdomc)
 			continue;
+		WRITE_ONCE(cpdomc->nr_active_cpus, cpdomc->nr_acpus_temp);
+		WRITE_ONCE(cpdomc->nr_acpus_temp, 0);
+		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
+		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
 
-		if (!bpf_cpumask_intersects(cast_mask(active), cast_mask(cd_cpumask)))
-			WRITE_ONCE(cpdomc->is_active, false);
+		if (cpdomc->nr_active_cpus)
+			nr_active_cpdoms++;
 	}
+	sys_stat.nr_active_cpdoms = nr_active_cpdoms;
 
 unlock_out:
 	bpf_rcu_read_unlock();
@@ -277,8 +287,6 @@ static int do_set_power_profile(s32 pm, int util)
 	switch (pm) {
 	case LAVD_PM_PERFORMANCE:
 		no_core_compaction = true;
-		no_freq_scaling = false;
-		no_prefer_turbo_core = false;
 		is_powersave_mode = false;
 
 		/*
@@ -295,16 +303,12 @@ static int do_set_power_profile(s32 pm, int util)
 		break;
 	case LAVD_PM_BALANCED:
 		no_core_compaction = false;
-		no_freq_scaling = false;
-		no_prefer_turbo_core = false;
 		is_powersave_mode = false;
 		reinit_cpumask_for_performance = false;
 		debugln("Set the scheduler's power profile to balanced mode: %d", util);
 		break;
 	case LAVD_PM_POWERSAVE:
 		no_core_compaction = false;
-		no_freq_scaling = false;
-		no_prefer_turbo_core = true;
 		is_powersave_mode = true;
 		reinit_cpumask_for_performance = false;
 		debugln("Set the scheduler's power profile to power-save mode: %d", util);
@@ -423,6 +427,9 @@ static int reinit_active_cpumask_for_performance(void)
 	struct cpu_ctx *cpuc;
 	struct bpf_cpumask *active, *ovrflw;
 	const struct cpumask *online_cpumask;
+	struct cpdom_ctx *cpdomc;
+	u64 dsq_id;
+	u32 nr_active_cpdoms = 0;
 	int cpu, err = 0;
 
 	barrier();
@@ -450,18 +457,27 @@ static int reinit_active_cpumask_for_performance(void)
 	if (have_little_core) {
 		bpf_for(cpu, 0, nr_cpu_ids) {
 			cpuc = get_cpu_ctx_id(cpu);
-			if (!cpuc) {
-				err = -ESRCH;
-				goto unlock_out;
+			if (!cpuc)
+				continue;
+			if (!cpuc->is_online) {
+				bpf_cpumask_clear_cpu(cpu, active);
+				bpf_cpumask_clear_cpu(cpu, ovrflw);
+				continue;
 			}
 
 			if (cpuc->big_core) {
 				bpf_cpumask_set_cpu(cpu, active);
 				bpf_cpumask_clear_cpu(cpu, ovrflw);
-			}
-			else {
+			} else {
 				bpf_cpumask_set_cpu(cpu, ovrflw);
 				bpf_cpumask_clear_cpu(cpu, active);
+			}
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+			if (cpdomc) {
+				cpdomc->nr_acpus_temp++;
+				cpdomc->cap_sum_temp += cpuc->capacity;
 			}
 		}
 	} else {
@@ -471,8 +487,41 @@ static int reinit_active_cpumask_for_performance(void)
 		scx_bpf_put_cpumask(online_cpumask);
 
 		bpf_cpumask_clear(ovrflw);
+
+		bpf_for(cpu, 0, nr_cpu_ids) {
+			cpuc = get_cpu_ctx_id(cpu);
+			if (!cpuc || !cpuc->is_online)
+				continue;
+
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+			cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+			if (cpdomc) {
+				cpdomc->nr_acpus_temp++;
+				cpdomc->cap_sum_temp += cpuc->capacity;
+			}
+		}
+
+	}
+
+	/*
+	 * Update nr_active_cpus and cap_sum_active_cpus.
+	 */
+	bpf_for(dsq_id, 0, nr_cpdoms) {
+		if (dsq_id >= LAVD_CPDOM_MAX_NR)
+			break;
+
+		cpdomc = MEMBER_VPTR(cpdom_ctxs, [dsq_id]);
+		WRITE_ONCE(cpdomc->nr_active_cpus, cpdomc->nr_acpus_temp);
+		WRITE_ONCE(cpdomc->nr_acpus_temp, 0);
+		WRITE_ONCE(cpdomc->cap_sum_active_cpus, cpdomc->cap_sum_temp);
+		WRITE_ONCE(cpdomc->cap_sum_temp, 0);
+
+		if (cpdomc->nr_active_cpus)
+			nr_active_cpdoms++;
 	}
 	sys_stat.nr_active = nr_cpus_onln;
+	sys_stat.nr_active_cpdoms = nr_active_cpdoms;
 
 unlock_out:
 	bpf_rcu_read_unlock();

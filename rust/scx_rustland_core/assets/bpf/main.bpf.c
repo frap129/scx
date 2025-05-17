@@ -433,7 +433,8 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu)
 	 * CPU (ignore if this cpumask completely overlaps with the task's
 	 * cpumask).
 	 */
-	bpf_cpumask_and(l2_mask, p->cpus_ptr, cast_mask(l2_domain));
+	if (!bpf_cpumask_and(l2_mask, p->cpus_ptr, cast_mask(l2_domain)))
+		l2_mask = NULL;
 
 	/*
 	 * Determine the L3 cache domain as the intersection of the task's
@@ -441,7 +442,8 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu)
 	 * CPU (ignore if this cpumask completely overlaps with the task's
 	 * cpumask).
 	 */
-	bpf_cpumask_and(l3_mask, p->cpus_ptr, cast_mask(l3_domain));
+	if (!bpf_cpumask_and(l3_mask, p->cpus_ptr, cast_mask(l3_domain)))
+		l3_mask = NULL;
 
 	/*
 	 * Find the best idle CPU, prioritizing full idle cores in SMT systems.
@@ -462,19 +464,23 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu)
 		 * Search for any full-idle CPU in the task domain that shares
 		 * the same L2 cache.
 		 */
-		cpu = bpf_cpumask_any_and_distribute(cast_mask(l2_mask), idle_smtmask);
-		if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
-		    scx_bpf_test_and_clear_cpu_idle(cpu))
-			goto out_put_cpumask;
+		if (l2_mask) {
+			cpu = bpf_cpumask_any_and_distribute(cast_mask(l2_mask), idle_smtmask);
+			if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(cpu))
+				goto out_put_cpumask;
+		}
 
 		/*
 		 * Search for any full-idle CPU in the task domain that shares
 		 * the same L3 cache.
 		 */
-		cpu = bpf_cpumask_any_and_distribute(cast_mask(l3_mask), idle_smtmask);
-		if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
-		    scx_bpf_test_and_clear_cpu_idle(cpu))
-			goto out_put_cpumask;
+		if (l3_mask) {
+			cpu = bpf_cpumask_any_and_distribute(cast_mask(l3_mask), idle_smtmask);
+			if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(cpu))
+				goto out_put_cpumask;
+		}
 
 		/*
 		 * Otherwise, search for another usable full-idle core.
@@ -499,19 +505,23 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu)
 	 * Search for any idle CPU in the primary domain that shares the same
 	 * L2 cache.
 	 */
-	cpu = bpf_cpumask_any_and_distribute(cast_mask(l2_mask), idle_cpumask);
-	if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
-	    scx_bpf_test_and_clear_cpu_idle(cpu))
-		goto out_put_cpumask;
+	if (l2_mask) {
+		cpu = bpf_cpumask_any_and_distribute(cast_mask(l2_mask), idle_cpumask);
+		if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
+		    scx_bpf_test_and_clear_cpu_idle(cpu))
+			goto out_put_cpumask;
+	}
 
 	/*
 	 * Search for any idle CPU in the primary domain that shares the same
 	 * L3 cache.
 	 */
-	cpu = bpf_cpumask_any_and_distribute(cast_mask(l3_mask), idle_cpumask);
-	if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
-	    scx_bpf_test_and_clear_cpu_idle(cpu))
-		goto out_put_cpumask;
+	if (l3_mask) {
+		cpu = bpf_cpumask_any_and_distribute(cast_mask(l3_mask), idle_cpumask);
+		if (bpf_cpumask_test_cpu(cpu, online_cpumask) &&
+		    scx_bpf_test_and_clear_cpu_idle(cpu))
+			goto out_put_cpumask;
+	}
 
 	/*
 	 * If all the previous attempts have failed, try to use any idle CPU in
@@ -545,7 +555,6 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	struct task_struct *p;
 	struct task_ctx *tctx;
 	u64 dsq_id, curr_cpumask_cnt;
-	s32 cpu;
 
 	/* Ignore entry if the task doesn't exist anymore */
 	p = bpf_task_from_pid(task->pid);
@@ -567,7 +576,8 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 */
 	if (task->cpu == RL_CPU_ANY) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, task->slice_ns, task->vtime, task->flags);
-		goto out_kick_idle_cpu;
+		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
+		goto out_release;
 	}
 
 	/* Read current cpumask generation counter */
@@ -577,7 +587,8 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, task->slice_ns, task->vtime, task->flags);
 		__sync_fetch_and_add(&nr_bounce_dispatches, 1);
-		goto out_kick_idle_cpu;
+		scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
+		goto out_release;
 	}
 
 	/*
@@ -609,15 +620,19 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	if (task->cpu != bpf_get_smp_processor_id())
 		scx_bpf_kick_cpu(task->cpu, SCX_KICK_IDLE);
 
-	goto out_release;
-
-out_kick_idle_cpu:
-	cpu = pick_idle_cpu(p, task->cpu);
-	if (cpu >= 0)
-		scx_bpf_kick_cpu(cpu, 0);
-
 out_release:
 	bpf_task_release(p);
+}
+
+/*
+ * Return true if the waker commits to release the CPU after waking up @p,
+ * false otherwise.
+ */
+static bool is_wake_sync(u64 wake_flags)
+{
+	const struct task_struct *current = (void *)bpf_get_current_task_btf();
+
+	return (wake_flags & SCX_WAKE_SYNC) && !(current->flags & PF_EXITING);
 }
 
 s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -634,11 +649,22 @@ s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!builtin_idle || is_usersched_task(p))
 		return prev_cpu;
 
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	/*
+	 * Exclude sync wakeup, since we are handling this special case
+	 * below.
+	 */
+	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags & !SCX_WAKE_SYNC, &is_idle);
 	if (is_idle && !scx_bpf_dsq_nr_queued(SHARED_DSQ)) {
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu), SCX_SLICE_DFL, p->scx.dsq_vtime, 0);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 	}
+
+	/*
+	 * If we couldn't find an idle CPU, in case of a sync wakeup
+	 * prioritize the waker's CPU.
+	 */
+	if (!is_idle && is_wake_sync(wake_flags))
+		return bpf_get_smp_processor_id();
 
 	return cpu;
 }
@@ -1288,7 +1314,7 @@ SCX_OPS_DEFINE(rustland,
 	       .init_task		= (void *)rustland_init_task,
 	       .init			= (void *)rustland_init,
 	       .exit			= (void *)rustland_exit,
-	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_ENQ_LAST,
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_MIGRATION_DISABLED,
 	       .timeout_ms		= 5000,
 	       .dispatch_max_batch	= MAX_DISPATCH_SLOT,
 	       .name			= "rustland");
