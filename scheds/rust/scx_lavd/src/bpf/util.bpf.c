@@ -30,12 +30,12 @@ volatile bool		no_preemption;
 volatile bool		no_wake_sync;
 volatile bool		no_core_compaction;
 volatile bool		no_freq_scaling;
-volatile bool		no_prefer_turbo_core;
 volatile bool		is_powersave_mode;
 volatile bool		reinit_cpumask_for_performance;
 const volatile bool	is_autopilot_on;
 const volatile bool	is_smt_active;
 const volatile u8	verbose;
+const volatile u8	preempt_shift;
 
 /*
  * Exit information
@@ -146,18 +146,18 @@ static u32 calc_avg32(u32 old_val, u32 new_val)
 {
 	/*
 	 * Calculate the exponential weighted moving average (EWMA).
-	 *  - EWMA = (0.75 * old) + (0.25 * new)
+	 *  - EWMA = (0.9375 * old) + (0.0625 * new)
 	 */
-	return (old_val - (old_val >> 2)) + (new_val >> 2);
+	return (old_val - (old_val >> 4)) + (new_val >> 4);
 }
 
 static u64 calc_avg(u64 old_val, u64 new_val)
 {
 	/*
 	 * Calculate the exponential weighted moving average (EWMA).
-	 *  - EWMA = (0.75 * old) + (0.25 * new)
+	 *  - EWMA = (0.9375 * old) + (0.0625 * new)
 	 */
-	return (old_val - (old_val >> 2)) + (new_val >> 2);
+	return (old_val - (old_val >> 4)) + (new_val >> 4);
 }
 
 static u64 calc_asym_avg(u64 old_val, u64 new_val)

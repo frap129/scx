@@ -34,6 +34,7 @@ struct llc_ctx {
 	struct bpf_cpumask __kptr	*cpumask;
 	struct bpf_cpumask __kptr	*big_cpumask;
 	struct bpf_cpumask __kptr	*little_cpumask;
+	struct bpf_cpumask __kptr	*node_cpumask;
 };
 
 struct node_ctx {
@@ -45,14 +46,14 @@ struct node_ctx {
 
 struct task_p2dq {
 	u64			dsq_id;
+	u64			slice_ns;
 	int			dsq_index;
 	u32			cpu;
 	u32			llc_id;
 	u32			node_id;
-	bool			runnable;
-	u32			weight;
 	u64			used;
 	u64			last_dsq_id;
+	u64 			last_run_started;
 	u64 			last_run_at;
 	u64			llc_runs; /* how many runs on the current LLC */
 	int			last_dsq_index;

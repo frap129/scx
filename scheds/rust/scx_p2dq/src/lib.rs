@@ -5,8 +5,14 @@
 pub use scx_utils::CoreType;
 use scx_utils::Topology;
 pub use scx_utils::NR_CPU_IDS;
+use scx_utils::{Core, Llc};
 
+use anyhow::{bail, Result};
 use clap::Parser;
+use libbpf_rs::ProgramInput;
+use libbpf_rs::ProgramOutput;
+
+use std::sync::Arc;
 
 lazy_static::lazy_static! {
         pub static ref TOPO: Topology = Topology::new().unwrap();
@@ -40,6 +46,10 @@ pub struct SchedulerOpts {
     #[clap(short = 'e', long, action = clap::ArgAction::SetTrue)]
     pub eager_load_balance: bool,
 
+    /// Enables CPU frequency control.
+    #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
+    pub freq_control: bool,
+
     /// ***DEPRECATED*** Disables greedy idle CPU selection, may cause better load balancing on
     /// multi-LLC systems.
     #[clap(short = 'g', long, default_value_t = get_default_greedy_disable(), action = clap::ArgAction::Set)]
@@ -48,6 +58,10 @@ pub struct SchedulerOpts {
     /// Interactive tasks stay sticky to their CPU if no idle CPU is found.
     #[clap(short = 'y', long, action = clap::ArgAction::SetTrue)]
     pub interactive_sticky: bool,
+
+    /// Interactive tasks are FIFO scheduled
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub interactive_fifo: bool,
 
     /// Disables pick2 load balancing on the dispatch path.
     #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
@@ -73,6 +87,10 @@ pub struct SchedulerOpts {
     /// Allow LLC migrations on the wakeup path.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub wakeup_llc_migrations: bool,
+
+    /// Allow selecting idle in enqueue path.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub select_idle_in_enqueue: bool,
 
     /// Set idle QoS resume latency based in microseconds.
     #[clap(long)]
@@ -125,6 +143,110 @@ pub fn dsq_slice_ns(dsq_index: u64, min_slice_us: u64, dsq_shift: u64) -> u64 {
         1000 * (min_slice_us << (dsq_index as u32) << dsq_shift)
     };
     result
+}
+
+/// Trait for interfacing with BPF arena programs
+pub trait P2dqArenaProgs {
+    /// Run the arena initialization program and return the result
+    fn run_arena_init<'a>(&self, input: ProgramInput<'a>) -> Result<ProgramOutput<'a>>;
+
+    /// Run the allocation mask program and return the result
+    fn run_alloc_mask<'a>(&self, input: ProgramInput<'a>) -> Result<ProgramOutput<'a>>;
+
+    /// Run the topology node initialization program and return the result
+    fn run_topology_node_init<'a>(&self, input: ProgramInput<'a>) -> Result<ProgramOutput<'a>>;
+
+    /// Access to the setup pointer in BSS data
+    fn setup_ptr(&self) -> u64;
+}
+
+pub fn setup_arenas<T: P2dqArenaProgs>(skel: &T) -> Result<()> {
+    // Allocate the arena memory from the BPF side so userspace initializes it before starting
+    // the scheduler. Despite the function call's name this is neither a test nor a test run,
+    // it's the recommended way of executing SEC("syscall") probes.
+    let input = ProgramInput {
+        ..Default::default()
+    };
+
+    let output = skel.run_arena_init(input)?;
+    if output.return_value != 0 {
+        bail!(
+            "Could not initialize arenas, p2dq_setup returned {}",
+            output.return_value as i32
+        );
+    }
+
+    Ok(())
+}
+
+fn setup_topology_node<T: P2dqArenaProgs>(skel: &T, mask: &[u64]) -> Result<()> {
+    // Copy the address of ptr to the kernel to populate it from BPF with the arena pointer.
+    let input = ProgramInput {
+        ..Default::default()
+    };
+
+    let output = skel.run_alloc_mask(input)?;
+    if output.return_value != 0 {
+        bail!(
+            "Could not initialize arenas, setup_topology_node returned {}",
+            output.return_value as i32
+        );
+    }
+
+    let ptr = unsafe { std::mem::transmute::<u64, &mut [u64; 10]>(skel.setup_ptr()) };
+
+    let (valid_mask, _) = ptr.split_at_mut(mask.len());
+    valid_mask.clone_from_slice(mask);
+
+    let input = ProgramInput {
+        ..Default::default()
+    };
+    let output = skel.run_topology_node_init(input)?;
+    if output.return_value != 0 {
+        bail!(
+            "p2dq_topology_node_init returned {}",
+            output.return_value as i32
+        );
+    }
+
+    Ok(())
+}
+
+pub fn setup_topology<T: P2dqArenaProgs>(skel: &T) -> Result<()> {
+    let topo = Topology::new().expect("Failed to build host topology");
+
+    setup_topology_node(skel, topo.span.as_raw_slice())?;
+
+    for (_, node) in topo.nodes {
+        setup_topology_node(skel, node.span.as_raw_slice())?;
+    }
+
+    for (_, llc) in topo.all_llcs {
+        setup_topology_node(
+            skel,
+            Arc::<Llc>::into_inner(llc)
+                .expect("missing llc")
+                .span
+                .as_raw_slice(),
+        )?;
+    }
+
+    for (_, core) in topo.all_cores {
+        setup_topology_node(
+            skel,
+            Arc::<Core>::into_inner(core)
+                .expect("missing core")
+                .span
+                .as_raw_slice(),
+        )?;
+    }
+    for (_, cpu) in topo.all_cpus {
+        let mut mask = [0; 9];
+        mask[cpu.id.checked_shr(64).unwrap_or(0)] |= 1 << (cpu.id % 64);
+        setup_topology_node(skel, &mask)?;
+    }
+
+    Ok(())
 }
 
 #[macro_export]
@@ -195,12 +317,14 @@ macro_rules! init_open_skel {
             $skel.maps.rodata_data.dispatch_lb_busy = opts.dispatch_lb_busy;
             $skel.maps.rodata_data.dispatch_lb_interactive = opts.dispatch_lb_interactive;
             $skel.maps.rodata_data.eager_load_balance = !opts.eager_load_balance;
+            $skel.maps.rodata_data.freq_control = opts.freq_control;
             $skel.maps.rodata_data.has_little_cores = $crate::TOPO.has_little_cores();
             $skel.maps.rodata_data.interactive_sticky = opts.interactive_sticky;
+            $skel.maps.rodata_data.interactive_fifo = opts.interactive_fifo;
             $skel.maps.rodata_data.keep_running_enabled = opts.keep_running;
             $skel.maps.rodata_data.max_dsq_pick2 = opts.max_dsq_pick2;
             $skel.maps.rodata_data.smt_enabled = $crate::TOPO.smt_enabled;
-            $skel.maps.rodata_data.select_idle_in_enqueue = true;
+            $skel.maps.rodata_data.select_idle_in_enqueue = opts.select_idle_in_enqueue;
             $skel.maps.rodata_data.wakeup_lb_busy = opts.wakeup_lb_busy;
             $skel.maps.rodata_data.wakeup_llc_migrations = opts.wakeup_llc_migrations;
             $skel.maps.rodata_data.max_exec_ns =
@@ -224,6 +348,9 @@ macro_rules! init_skel {
             $skel.maps.bss_data.cpu_llc_ids[cpu.id] = cpu.llc_id as u64;
             $skel.maps.bss_data.cpu_node_ids[cpu.id] = cpu.node_id as u64;
         }
+
+        $crate::setup_arenas($skel)?;
+        $crate::setup_topology($skel)?;
     };
 }
 

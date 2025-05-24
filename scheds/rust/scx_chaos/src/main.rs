@@ -9,13 +9,12 @@ use scx_chaos::Trait;
 
 use scx_p2dq::SchedulerOpts as P2dqOpts;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::info;
 use nix::unistd::Pid;
 
 use std::panic;
-use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Condvar;
@@ -37,6 +36,34 @@ pub struct RandomDelayArgs {
     /// Maximum time to add for random delay.
     #[clap(long, requires = "random_delay_frequency")]
     pub random_delay_max_us: Option<u64>,
+}
+
+/// Randomly CPU frequency scale a process.
+#[derive(Debug, Parser)]
+pub struct CpuFreqArgs {
+    /// Chance of randomly delaying a process.
+    #[clap(long, requires = "cpufreq_max")]
+    pub cpufreq_frequency: Option<f64>,
+
+    /// Minimum CPU frequency for scaling.
+    #[clap(long, requires = "cpufreq_frequency")]
+    pub cpufreq_min: Option<u32>,
+
+    /// Minimum CPU frequency for scaling.
+    #[clap(long, requires = "cpufreq_min")]
+    pub cpufreq_max: Option<u32>,
+}
+
+/// Introduces a perf degradation
+#[derive(Debug, Parser)]
+pub struct PerfDegradationArgs {
+    /// Chance of degradating a process.
+    #[clap(long)]
+    pub degradation_frequency: Option<f64>,
+
+    /// Amount to degradate a process.
+    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u64).range(0..129))]
+    pub degradation_frac7: u64,
 }
 
 /// scx_chaos: A general purpose sched_ext scheduler designed to amplify race conditions
@@ -76,6 +103,12 @@ pub struct Args {
 
     #[command(flatten, next_help_heading = "Random Delays")]
     pub random_delay: RandomDelayArgs,
+
+    #[command(flatten, next_help_heading = "Perf Degradation")]
+    pub perf_degradation: PerfDegradationArgs,
+
+    #[command(flatten, next_help_heading = "CPU Frequency")]
+    pub cpu_freq: CpuFreqArgs,
 
     #[command(flatten, next_help_heading = "General Scheduling")]
     pub p2dq: P2dqOpts,
@@ -135,6 +168,18 @@ impl<'a> Iterator for BuilderIterator<'a> {
                     max_us,
                 });
             };
+            if let CpuFreqArgs {
+                cpufreq_frequency: Some(frequency),
+                cpufreq_min: Some(min_freq),
+                cpufreq_max: Some(max_freq),
+            } = self.args.cpu_freq
+            {
+                traits.push(Trait::CpuFreq {
+                    frequency,
+                    min_freq,
+                    max_freq,
+                });
+            };
 
             let requires_ppid = if self.args.ppid_targeting {
                 if let Some(p) = self.args.pid {
@@ -178,10 +223,6 @@ fn main() -> Result<()> {
         simplelog::ColorChoice::Auto,
     )?;
 
-    if args.pid.is_some() {
-        return Err(anyhow!("args.pid is not yet implemented"));
-    }
-
     let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
 
     ctrlc::set_handler({
@@ -202,7 +243,7 @@ fn main() -> Result<()> {
             for builder in BuilderIterator::from(&*args) {
                 info!("{:?}", &builder);
 
-                let sched: Pin<Box<Scheduler>> = builder.try_into()?;
+                let sched: Scheduler = builder.try_into()?;
 
                 sched.observe(&shutdown, None)?;
             }
@@ -210,6 +251,29 @@ fn main() -> Result<()> {
             Ok(())
         }
     });
+
+    if let Some(pid) = args.pid {
+        info!("Monitoring process with PID: {}", pid);
+
+        let is_process_running = |pid: libc::pid_t| -> bool {
+            unsafe {
+                // SAFETY: kill with signal 0 only runs validity checks. There's no chance of
+                // memory unsafety here.
+                libc::kill(pid, 0) == 0
+            }
+        };
+
+        while is_process_running(pid) && !*shutdown.0.lock().unwrap() {
+            if scheduler_thread.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        if !is_process_running(pid) {
+            info!("app under test terminated, exiting...");
+        }
+    }
 
     let mut should_run_app = !args.args.is_empty();
     while should_run_app {
@@ -244,16 +308,16 @@ fn main() -> Result<()> {
         }
     }
 
-    if !args.args.is_empty() {
+    // Notify shutdown if we're exiting due to args or pid termination
+    if !args.args.is_empty() || args.pid.is_some() {
         let (lock, cvar) = &*shutdown;
         *lock.lock().unwrap() = true;
         cvar.notify_all();
     }
 
-    match scheduler_thread.join() {
-        Ok(_) => {}
-        Err(e) => panic::resume_unwind(e),
-    };
+    if let Err(e) = scheduler_thread.join() {
+        panic::resume_unwind(e);
+    }
 
     Ok(())
 }

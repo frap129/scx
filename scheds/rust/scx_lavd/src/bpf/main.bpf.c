@@ -214,11 +214,11 @@ const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 #include "util.bpf.c"
 #include "power.bpf.c"
 #include "introspec.bpf.c"
-#include "sys_stat.bpf.c"
 #include "preempt.bpf.c"
 #include "lock.bpf.c"
 #include "idle.bpf.c"
 #include "balance.bpf.c"
+#include "sys_stat.bpf.c"
 
 static u32 calc_greedy_ratio(struct task_ctx *taskc)
 {
@@ -247,7 +247,6 @@ static u32 calc_greedy_factor(u32 greedy_ratio)
 	 * For over-utilized tasks, we give some mild penalty.
 	 */
 	return LAVD_SCALE + ((greedy_ratio - LAVD_SCALE) / LAVD_LC_GREEDY_PENALTY);
-
 }
 
 static inline u64 calc_runtime_factor(u64 runtime)
@@ -395,15 +394,10 @@ static u64 calc_adjusted_runtime(struct task_ctx *taskc)
 	 * (acc_runtime) task. To avoid the starvation of CPU-bound tasks,
 	 * which rarely sleep, limit the impact of acc_runtime.
 	 */
-	runtime = taskc->avg_runtime +
+	runtime = LAVD_ACC_RUNTIME_MAX +
 		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
 
-	/*
-	 * Convert highly skewed runtime distribution to
-	 * mildly skewed distribution.
-	 */
-	u64 adj_runtime = log2_u64(runtime + 1);
-	return adj_runtime * adj_runtime;
+	return runtime;
 }
 
 static u64 calc_virtual_deadline_delta(struct task_struct *p,
@@ -1632,10 +1626,11 @@ static s32 init_per_cpu_ctx(u64 now)
 					cpuc->cpdom_id = cpdomc->id;
 					cpuc->cpdom_alt_id = cpdomc->alt_id;
 
-					if (bpf_cpumask_test_cpu(cpu, online_cpumask))
+					if (bpf_cpumask_test_cpu(cpu, online_cpumask)) {
 						bpf_cpumask_set_cpu(cpu, cd_cpumask);
-					if (bpf_cpumask_test_cpu(cpu, cast_mask(active)))
-						WRITE_ONCE(cpdomc->is_active, true);
+						cpdomc->nr_active_cpus++;
+						cpdomc->cap_sum_active_cpus += cpuc->capacity;
+					}
 					cpdomc->nr_cpus++;
 				}
 			}

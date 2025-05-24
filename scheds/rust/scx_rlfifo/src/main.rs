@@ -44,15 +44,16 @@
 //!
 //! Each task received from dequeue_task() contains the following:
 //!
+//!
 //! struct QueuedTask {
 //!     pub pid: i32,              // pid that uniquely identifies a task
 //!     pub cpu: i32,              // CPU previously used by the task
+//!     pub nr_cpus_allowed: u64,  // Number of CPUs that the task can use
 //!     pub flags: u64,            // task's enqueue flags
-//!     pub exec_runtime: u64,     // Total cpu time in nanoseconds
-//!     pub sum_exec_runtime: u64, // Total cpu time in nanoseconds
+//!     pub start_ts: u64,         // Timestamp since last time the task ran on a CPU (in ns)
+//!     pub stop_ts: u64,          // Timestamp since last time the task released a CPU (in ns)
+//!     pub exec_runtime: u64,     // Total cpu time since last sleep (in ns)
 //!     pub weight: u64,           // Task priority in the range [1..10000] (default is 100)
-//!     pub nvcsw: u64,            // Total amount of voluntary context switches
-//!     pub slice: u64,            // Remaining time slice budget
 //!     pub vtime: u64,            // Current task vruntime / deadline (set by the scheduler)
 //! }
 //!
@@ -110,7 +111,7 @@ impl<'a> Scheduler<'a> {
             0,     // exit_dump_len (buffer size of exit info, 0 = default)
             false, // partial (false = include all tasks)
             false, // debug (false = debug mode off)
-            false, // builtin_idle (false = idle selection policy in user-space)
+            true,  // builtin_idle (true = allow BPF to use idle CPUs if available)
         )?;
         Ok(Self { bpf })
     }
@@ -130,9 +131,9 @@ impl<'a> Scheduler<'a> {
             // A call to select_cpu() will return the most suitable idle CPU for the task,
             // prioritizing its previously used CPU (task.cpu).
             //
-            // If we can't find any idle CPU, keep the task running on the same CPU.
+            // If we can't find any idle CPU, run on the first CPU available.
             let cpu = self.bpf.select_cpu(task.pid, task.cpu, task.flags);
-            dispatched_task.cpu = if cpu >= 0 { cpu } else { task.cpu };
+            dispatched_task.cpu = if cpu >= 0 { cpu } else { RL_CPU_ANY };
 
             // Determine the task's time slice: assign value inversely proportional to the number
             // of tasks waiting to be scheduled.

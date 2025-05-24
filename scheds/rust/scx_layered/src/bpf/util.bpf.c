@@ -86,6 +86,11 @@ __hidden char *format_cgrp_path(struct cgroup *cgrp)
 	return path;
 }
 
+__hidden __noinline int clamp_pathind(int i)
+{
+	return i > 0 ? i % MAX_PATH : 0;
+}
+
 bool __noinline match_prefix_suffix(const char *prefix, const char *str, bool match_suffix)
 {
 	u32 c, zero = 0;
@@ -123,20 +128,17 @@ bool __noinline match_prefix_suffix(const char *prefix, const char *str, bool ma
 
 	if (match_suffix)
 		offset = str_len - match_str_len;
-	
-	// use MAX_PATH instead of str_len for when 
+
+	// use MAX_PATH instead of str_len for when
 	// prefix/suffix == string.
 	bpf_for(c, offset, MAX_PATH) {
 		i = c - offset;
 
-		if ((c > MAX_PATH) || (i >= MAX_PATH) || (i < 0))
-			return false;
-
-		if (match_buf[i] == '\0')
+		if (match_buf[clamp_pathind(i)] == '\0')
 			return true;
-		
-		if (str_buf[c] != match_buf[i])
-			return false;	
+
+		if (str_buf[clamp_pathind(c)] != match_buf[clamp_pathind(i)])
+			return false;
 	}
 	return false;
 }

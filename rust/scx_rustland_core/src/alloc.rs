@@ -478,10 +478,7 @@ impl UserAllocator {
     #[allow(static_mut_refs)]
     pub fn lock_memory(&self) {
         unsafe {
-            match VM.save() {
-                Ok(_) => {}
-                Err(res) => eprintln!("WARNING: {}\n", res),
-            };
+            VM.save().ok();
 
             // Call setrlimit to set the locked-in-memory limit to unlimited.
             let new_rlimit = libc::rlimit {
@@ -498,16 +495,17 @@ impl UserAllocator {
             if res != 0 {
                 panic!("mlockall failed with error code: {}", res);
             }
-        };
+
+            // Hint the kernel to use huge pages for the memory arena.
+            let ptr = &mut HEAP.0 as *mut u8 as *mut libc::c_void;
+            libc::madvise(ptr, HEAP_SIZE, libc::MADV_HUGEPAGE);
+        }
     }
 
     #[allow(static_mut_refs)]
     pub fn unlock_memory(&self) {
         unsafe {
-            match VM.restore() {
-                Ok(_) => {}
-                Err(res) => eprintln!("WARNING: {}\n", res),
-            }
+            VM.restore().ok();
         };
     }
 }
