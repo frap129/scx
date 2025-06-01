@@ -12,10 +12,16 @@
 #include "../../../../include/scx/common.bpf.h"
 #include "../../../../include/scx/bpf_arena_common.h"
 #include "../../../../include/lib/sdt_task.h"
+#include "../../../../include/lib/cpumask.h"
+#include "../../../../include/lib/percpu.h"
+#include "../../../../include/lib/topology.h"
 #else
 #include <scx/common.bpf.h>
 #include <scx/bpf_arena_common.h>
 #include <lib/sdt_task.h>
+#include <lib/cpumask.h>
+#include <lib/percpu.h>
+#include <lib/topology.h>
 #endif
 
 #include "intf.h"
@@ -39,7 +45,6 @@ UEI_DEFINE(uei);
 #define dbg(fmt, args...)	do { if (debug) bpf_printk(fmt, ##args); } while (0)
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
-
 /*
  * Domains and cpus
  */
@@ -58,9 +63,11 @@ const volatile bool autoslice = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
 const volatile bool interactive_sticky = false;
+const volatile bool interactive_fifo = false;
 const volatile bool keep_running_enabled = true;
 const volatile bool kthreads_local = true;
 const volatile bool max_dsq_pick2 = false;
+const volatile bool freq_control = false;
 const volatile bool select_idle_in_enqueue = true;
 const volatile u64 max_exec_ns = 20 * NSEC_PER_MSEC;
 
@@ -68,16 +75,19 @@ const volatile bool dispatch_lb_interactive = false;
 const volatile u64 dispatch_lb_busy = 75;
 const volatile u64 wakeup_lb_busy = 90;
 const volatile bool wakeup_llc_migrations = false;
-const volatile u64 lb_slack_factor = 5;
+const volatile u64 lb_slack_factor = LOAD_BALANCE_SLACK;
 
 const volatile bool smt_enabled = true;
 const volatile bool has_little_cores = false;
 const volatile u32 debug = 2;
 
 const u32 zero_u32 = 0;
+extern const volatile u32 nr_cpu_ids;
 
 const u64 lb_timer_intvl_ns = 250LLU * NSEC_PER_MSEC;
 const u64 lb_backoff_ns = 5LLU * NSEC_PER_MSEC;
+
+static u32 llc_lb_offset = 1;
 
 u64 cpu_llc_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
@@ -90,17 +100,10 @@ u32 sched_mode = MODE_PERFORMANCE;
 private(A) struct bpf_cpumask __kptr *all_cpumask;
 private(A) struct bpf_cpumask __kptr *big_cpumask;
 
-
 static u64 max(u64 a, u64 b)
 {
 	return a >= b ? a : b;
 }
-
-static u64 min(u64 a, u64 b)
-{
-	return a <= b ? a : b;
-}
-
 
 static __always_inline u64 dsq_time_slice(int dsq_index)
 {
@@ -109,6 +112,11 @@ static __always_inline u64 dsq_time_slice(int dsq_index)
 		return 0;
 	}
 	return dsq_time_slices[dsq_index];
+}
+
+static __always_inline u64 max_dsq_time_slice(void)
+{
+	return dsq_time_slices[nr_dsqs_per_llc - 1];
 }
 
 static __always_inline u64 task_slice_ns(struct task_struct *p, int dsq_index)
@@ -272,11 +280,37 @@ static bool can_pick2(task_ctx *taskc)
 	if (is_interactive(taskc) ||
 	    !taskc->all_cpus ||
 	    taskc->is_kworker ||
-	    nr_llcs == 2 ||
+	    nr_llcs < 2 ||
 	    (max_dsq_pick2 > 0 && taskc->llc_runs < min_llc_runs_pick2))
 		return false;
 
 	return true;
+}
+
+/*
+ * Updates a tasks vtime based on the newly assigned cpu_ctx and returns the
+ * updated vtime.
+ */
+static __always_inline void update_vtime(struct task_struct *p,
+					 struct cpu_ctx *cpuc,
+					 task_ctx *taskc,
+					 u64 vtime_now)
+{
+	/*
+	 * If in the same LLC we only need to clamp the vtime to ensure no task
+	 * accumulates too much vtime.
+	 */
+	if (taskc->llc_id == cpuc->llc_id) {
+		u64 max_slice = max_dsq_time_slice();
+		u64 vtime_min = vtime_now - max_slice;
+
+		p->scx.dsq_vtime = max(p->scx.dsq_vtime, vtime_min);
+		return;
+	}
+
+	p->scx.dsq_vtime = vtime_now;
+
+	return;
 }
 
 /*
@@ -287,19 +321,15 @@ static struct llc_ctx *rand_llc_ctx(void)
 	return lookup_llc_ctx(bpf_get_prandom_u32() % nr_llcs);
 }
 
-static bool keep_running(struct cpu_ctx *cpuc, struct task_struct *p)
+static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx, struct task_struct *p)
 {
-	struct llc_ctx *llcx;
 	int i;
 
-	// Only tasks in the least non interactive DSQ can keep running
+	// Only tasks in the most interactive DSQs can keep running.
 	if (!keep_running_enabled ||
-	    cpuc->dsq_index != nr_dsqs_per_llc - 1 ||
+	    cpuc->dsq_index == nr_dsqs_per_llc - 1 ||
 	    p->scx.flags & SCX_TASK_QUEUED ||
 	    cpuc->ran_for >= max_exec_ns)
-		return false;
-
-	if (!(llcx = lookup_llc_ctx(cpuc->llc_id)))
 		return false;
 
 	int nr_queued = 0;
@@ -360,7 +390,7 @@ static struct llc_ctx *pick_two_llc_ctx(struct llc_ctx *cur_llcx, struct llc_ctx
 	if ((nr_llcs > 2 && (cur_load > left_load || cur_load > right_load)))
 	    return NULL;
 
-        if (left_load < right_load)
+    	if (left_load < right_load)
 		return right;
 	return left;
 }
@@ -452,14 +482,91 @@ pick_llc:
 	return -EINVAL;
 }
 
+static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
+				     s32 prev_cpu, bool *is_idle)
+{
+	const struct cpumask *idle_smtmask, *idle_cpumask;
+	struct mask_wrapper *wrapper;
+	struct bpf_cpumask *mask;
+	struct llc_ctx *llcx;
+	s32 cpu = prev_cpu;
+
+	idle_cpumask = scx_bpf_get_idle_cpumask();
+	idle_smtmask = scx_bpf_get_idle_smtmask();
+
+	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
+	    !llcx->cpumask)
+		goto found_cpu;
+
+	// First try last CPU
+	if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		cpu = prev_cpu;
+		*is_idle = true;
+		goto found_cpu;
+	}
+
+	wrapper = bpf_task_storage_get(&task_masks, p, 0, 0);
+	if (!wrapper) {
+		cpu = prev_cpu;
+		goto found_cpu;
+	}
+
+	mask = wrapper->mask;
+	if (!mask) {
+		cpu = prev_cpu;
+		goto found_cpu;
+	}
+
+	if (llcx->cpumask)
+		bpf_cpumask_and(mask, cast_mask(llcx->cpumask),
+				p->cpus_ptr);
+
+	// First try to find an idle SMT in the LLC
+	if (smt_enabled) {
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(mask),
+					    SCX_PICK_IDLE_CORE);
+		if (cpu >= 0) {
+			*is_idle = true;
+			goto found_cpu;
+		}
+	}
+
+	if (llcx->cpumask)
+		bpf_cpumask_and(mask, cast_mask(llcx->cpumask),
+				p->cpus_ptr);
+
+	// Next try to find an idle CPU in the LLC
+	cpu = scx_bpf_pick_idle_cpu(cast_mask(mask), 0);
+	if (cpu >= 0) {
+		*is_idle = true;
+		goto found_cpu;
+	}
+
+	// Next try to find an idle CPU in the node
+	if (llcx->node_cpumask && mask) {
+		bpf_cpumask_and(mask, cast_mask(llcx->node_cpumask),
+				p->cpus_ptr);
+		if ((cpu = scx_bpf_pick_idle_cpu(cast_mask(mask), 0)) >= 0) {
+			*is_idle = true;
+			goto found_cpu;
+		}
+	}
+
+	// Fallback to anywhere the task can run
+	cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+
+found_cpu:
+	scx_bpf_put_cpumask(idle_cpumask);
+	scx_bpf_put_cpumask(idle_smtmask);
+
+	return cpu;
+}
+
 static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *idle_smtmask, *idle_cpumask;
-	struct mask_wrapper *wrapper;
-	struct cpu_ctx *prev_cpuc;
-	struct bpf_cpumask *mask;
-	struct node_ctx *nodec;
 	struct llc_ctx *llcx;
 	bool interactive = is_interactive(taskc);
 	s32 cpu = prev_cpu;
@@ -476,68 +583,23 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		goto found_cpu;
 	}
 
-	if (!(prev_cpuc = lookup_cpu_ctx(prev_cpu)) ||
-	    !(llcx = lookup_llc_ctx(prev_cpuc->llc_id)) ||
-	    !(nodec = lookup_node_ctx(prev_cpuc->node_id)) ||
-	    !llcx->cpumask)
-		goto found_cpu;
-
-	// Special handling of tasks with custom affinities
-	if (!taskc->all_cpus) {
-		wrapper = bpf_task_storage_get(&task_masks, p, 0, 0);
-		if (!wrapper) {
-			cpu = prev_cpu;
-			goto found_cpu;
-		}
-
-		mask = wrapper->mask;
-		if (!mask) {
-			cpu = prev_cpu;
-			goto found_cpu;
-		}
-
-		// First try last CPU
-		if (bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr)) {
-			cpu = prev_cpu;
-			goto found_cpu;
-		}
-
-		if (llcx->cpumask)
-			bpf_cpumask_and(mask, cast_mask(llcx->cpumask),
-					p->cpus_ptr);
-
-		// First try to find an idle SMT in the LLC
-		if (smt_enabled) {
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(mask),
-						    SCX_PICK_IDLE_CORE);
-			if (cpu >= 0) {
-				*is_idle = true;
-				goto found_cpu;
-			}
-		}
-
-		// Next try to find an idle CPU in the LLC
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(mask), 0);
-		if (cpu >= 0) {
-			*is_idle = true;
-			goto found_cpu;
-		}
-
-		// Next try to find an idle CPU in the node
-		if (nodec->cpumask && mask) {
-			bpf_cpumask_and(mask, cast_mask(nodec->cpumask),
-					p->cpus_ptr);
-			if ((cpu = scx_bpf_pick_idle_cpu(cast_mask(mask), 0)) >= 0) {
-				*is_idle = true;
-				goto found_cpu;
-			}
-		}
-
-		// Fallback to anywhere the task can run
-		cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+	// First check if last CPU is idle
+	if (taskc->all_cpus &&
+	    bpf_cpumask_test_cpu(prev_cpu, (smt_enabled && !interactive) ?
+				 idle_smtmask : idle_cpumask) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		cpu = prev_cpu;
+		*is_idle = true;
 		goto found_cpu;
 	}
 
+	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
+	    !llcx->cpumask)
+		goto found_cpu;
+
+	if (taskc->dsq_id == SCX_DSQ_INVALID)
+		if (!(llcx = rand_llc_ctx()))
+			goto found_cpu;
 
 	/*
 	 * If the current task is waking up another task and releasing the CPU
@@ -545,13 +607,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	 * waker.
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
-		struct task_struct *current = (void *)bpf_get_current_task_btf();
-		task_ctx *cur_taskc = scx_task_data(current);
+		struct task_struct *waker = (void *)bpf_get_current_task_btf();
+		task_ctx *waker_taskc = scx_task_data(waker);
 		// Shouldn't happen, but makes code easier to follow
-		if (!cur_taskc) {
+		if (!waker_taskc) {
 			cpu = prev_cpu;
 			goto found_cpu;
 		}
+
 		// Interactive tasks aren't worth migrating across LLCs.
 		if (interactive) {
 			cpu = prev_cpu;
@@ -571,7 +634,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			cpu = prev_cpu;
 			goto found_cpu;
 		}
-		if (cur_taskc->llc_id == llcx->id || !wakeup_llc_migrations) {
+		if (waker_taskc->llc_id == llcx->id || !wakeup_llc_migrations) {
 			// First check if the waking task is in the same LLC
 			// and the prev cpu is idle
 			if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
@@ -601,12 +664,12 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			goto found_cpu;
 		}
 		// If wakeup LLC are allowed then migrate to the waker llc.
-		struct llc_ctx *cur_llcx = lookup_llc_ctx(cur_taskc->llc_id);
-		if (!cur_llcx)
+		struct llc_ctx *waker_llcx = lookup_llc_ctx(waker_taskc->llc_id);
+		if (!waker_llcx)
 			goto found_cpu;
 
-		if (cur_llcx->cpumask &&
-		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(cur_llcx->cpumask),
+		if (waker_llcx->cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(waker_llcx->cpumask),
 						 SCX_PICK_IDLE_CORE)) >= 0) {
 			stat_inc(P2DQ_STAT_WAKE_MIG);
 			*is_idle = true;
@@ -614,33 +677,32 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		}
 
 		// Couldn't find an idle core so just migrate to the CPU
-		if (cur_llcx->cpumask &&
-		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(cur_llcx->cpumask),
+		if (waker_llcx->cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(waker_llcx->cpumask),
 						 0)) >= 0) {
 			stat_inc(P2DQ_STAT_WAKE_MIG);
 			*is_idle = true;
 			goto found_cpu;
 		}
 		// Nothing idle, move to waker CPU
-		cpu = cur_taskc->cpu;
+		cpu = scx_bpf_task_cpu(waker);
 		goto found_cpu;
 	}
 
-	if (eager_load_balance && wakeup_lb_busy > 0 && nr_llcs > 1) {
+	if (llcx->lb_llc_id < MAX_LLCS && taskc->llc_runs > min_llc_runs_pick2) {
+		u32 target_llc_id = llcx->lb_llc_id;
+		llcx->lb_llc_id = MAX_LLCS;
+		if (!(llcx = lookup_llc_ctx(target_llc_id)))
+			goto found_cpu;
+		stat_inc(P2DQ_STAT_SELECT_PICK2);
+	}
+
+	if (eager_load_balance && wakeup_lb_busy > 0) {
 		cpu = pick_two_cpu(llcx, taskc, is_idle);
 		if (cpu >= 0) {
 			stat_inc(P2DQ_STAT_SELECT_PICK2);
 			goto found_cpu;
 		}
-	}
-
-	// First check if last CPU is idle
-	if (llcx->cpumask &&
-	    bpf_cpumask_test_cpu(prev_cpu, cast_mask(llcx->cpumask)) &&
-	    bpf_cpumask_test_cpu(prev_cpu, (smt_enabled && !interactive) ? idle_smtmask : idle_cpumask)) {
-		cpu = prev_cpu;
-		*is_idle = true;
-		goto found_cpu;
 	}
 
 	if (has_little_cores && llcx->little_cpumask && llcx->big_cpumask) {
@@ -685,8 +747,11 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Couldn't find anything idle just return something in the local LLC
-	if (llcx->cpumask)
+	if (interactive && llcx->cpumask)
 		cpu = bpf_cpumask_any_distribute(cast_mask(llcx->cpumask));
+	else
+		// non interactive tasks stay sticky
+		cpu = prev_cpu;
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
@@ -707,11 +772,14 @@ static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_
 	if (!(taskc = lookup_task_ctx(p)))
 		return prev_cpu;
 
-	cpu = pick_idle_cpu(p, taskc, prev_cpu, wake_flags, &is_idle);
+	if (!taskc->all_cpus) {
+		cpu = pick_idle_affinitized_cpu(p, taskc, prev_cpu, &is_idle);
+	} else {
+		cpu = pick_idle_cpu(p, taskc, prev_cpu, wake_flags, &is_idle);
+	}
 	if (is_idle) {
 		stat_inc(P2DQ_STAT_IDLE);
-		u64 slice_ns = task_slice_ns(p,taskc->dsq_index);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, taskc->slice_ns, 0);
 	}
 
 	return cpu;
@@ -732,92 +800,97 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 					       struct task_struct *p,
 					       u64 enq_flags)
 {
-	struct llc_ctx *llcx, *prev_llcx;
-	struct cpu_ctx *cpuc, *task_cpuc;
+	struct cpu_ctx *cpuc;
+	struct llc_ctx *llcx;
 	task_ctx *taskc;
-	u64 dsq_id;
+	s32 cpu = scx_bpf_task_cpu(p);
 
-	s32 cpu, task_cpu = scx_bpf_task_cpu(p);
-
-	if (!(cpuc = lookup_cpu_ctx(-1)) ||
-	    !(task_cpuc = lookup_cpu_ctx(task_cpu)) ||
-	    !(taskc = lookup_task_ctx(p)) ||
-	    !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+	/*
+	 * Per-cpu kthreads are considered interactive and dispatched directly
+	 * into the local DSQ.
+	 */
+	if ((p->flags & PF_KTHREAD) &&
+	    p->cpus_ptr == &p->cpus_mask &&
+	    p->nr_cpus_allowed != nr_cpus &&
+	    bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
+	    kthreads_local) {
+		stat_inc(P2DQ_STAT_DIRECT);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, dsq_time_slices[0], enq_flags);
 		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 		return;
 	}
 
-	u64 vtime_now = llcx->vtime;
-	u64 slice_ns = task_slice_ns(p,taskc->dsq_index);
-
-	// If the task in in another LLC need to update vtime.
-	if (taskc->llc_id != cpuc->llc_id) {
-		if (!(prev_llcx = lookup_llc_ctx(task_cpuc->llc_id))) {
-			ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
-			return;
-		}
-
-		u64 vtime_delta = p->scx.dsq_vtime - prev_llcx->vtime;
-		p->scx.dsq_vtime = vtime_now + vtime_delta;
-		trace("vtime change %llu, new vtime %llu",
-		      vtime_delta, p->scx.dsq_vtime);
+	if(!(taskc = lookup_task_ctx(p))) {
+		scx_bpf_error("invalid lookup");
+		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+		return;
 	}
 
-	u64 vtime = p->scx.dsq_vtime;
+	// Handle affinitized tasks separately
+	if (!taskc->all_cpus ||
+	    (p->cpus_ptr == &p->cpus_mask &&
+	    p->nr_cpus_allowed != nr_cpus)) {
+		bool is_idle = false;
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			cpu = pick_idle_affinitized_cpu(p, taskc, cpu, &is_idle);
 
-	/*
-	 * Limit the amount of budget that an idling task can accumulate to the
-	 * max possible slice.
-	 */
-	if (time_before(vtime, vtime_now - dsq_time_slice(nr_dsqs_per_llc - 1)))
-		vtime = vtime_now - slice_ns;
-
-	p->scx.dsq_vtime = vtime;
-
-	/*
-	 * Push per-cpu kthreads at the head of local dsq's and preempt the
-	 * corresponding CPU. This ensures that e.g. ksoftirqd isn't blocked
-	 * behind other threads which is necessary for forward progress
-	 * guarantee as we depend on the BPF timer which may run from ksoftirqd.
-	 */
-	if ((p->flags & PF_KTHREAD) && !taskc->all_cpus &&
-	    kthreads_local) {
-		stat_inc(P2DQ_STAT_DIRECT);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns,
-				   enq_flags | SCX_ENQ_PREEMPT);
-
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, enq_flags);
+		if (is_idle) {
+			stat_inc(P2DQ_STAT_IDLE);
+			scx_bpf_kick_cpu(cpu, 0);
+		}
 		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 		return;
 	}
 
 	// If an idle CPU hasn't been found in select_cpu find one now
-	if ((select_idle_in_enqueue && !__COMPAT_is_enq_cpu_selected(enq_flags)) ||
-	    !taskc->all_cpus) {
+	if (select_idle_in_enqueue && !__COMPAT_is_enq_cpu_selected(enq_flags)) {
 		bool is_idle = false;
-		cpu = pick_idle_cpu(p, taskc, taskc->cpu, 0, &is_idle);
-		cpuc = lookup_cpu_ctx(cpu);
-		if (cpuc && taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) {
-			dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
-			taskc->dsq_id = dsq_id;
-			scx_bpf_dsq_insert_vtime(p, dsq_id, slice_ns, p->scx.dsq_vtime, enq_flags);
-			if (is_idle) {
-				stat_inc(P2DQ_STAT_IDLE);
-				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-			}
-
+		cpu = pick_idle_cpu(p, taskc, cpu, 0, &is_idle);
+		if (!(cpuc = lookup_cpu_ctx(cpu)) ||
+		     !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+			scx_bpf_error("invalid lookup");
 			ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 			return;
 		}
+
+		taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+		update_vtime(p, cpuc, taskc, llcx->vtime);
+		if (interactive_fifo && taskc->dsq_index == 0) {
+			scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
+		} else {
+			scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
+		}
+		if (is_idle) {
+			stat_inc(P2DQ_STAT_IDLE);
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		}
+		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+		return;
 	}
 
-	dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
-	taskc->dsq_id = dsq_id;
+	if (!(cpuc = lookup_cpu_ctx(scx_bpf_task_cpu(p))) ||
+	    !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+		scx_bpf_error("invalid lookup");
+		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+		return;
+	}
 
-	ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
-	ret->vtime.dsq_id = dsq_id;
-	ret->vtime.enq_flags = enq_flags;
-	ret->vtime.slice_ns = slice_ns;
-	ret->vtime.vtime = p->scx.dsq_vtime;
+	taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+	update_vtime(p, cpuc, taskc, llcx->vtime);
+
+	if (interactive_fifo && taskc->dsq_index == 0) {
+		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
+		ret->fifo.dsq_id = taskc->dsq_id;
+		ret->fifo.enq_flags = enq_flags;
+		ret->fifo.slice_ns = taskc->slice_ns;
+	} else {
+		ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
+		ret->vtime.dsq_id = taskc->dsq_id;
+		ret->vtime.enq_flags = enq_flags;
+		ret->vtime.slice_ns = taskc->slice_ns;
+		ret->vtime.vtime = p->scx.dsq_vtime;
+	}
 }
 
 static __always_inline void complete_p2dq_enqueue(struct enqueue_promise *pro,
@@ -839,18 +912,7 @@ out:
 	pro->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 }
 
-static __always_inline void p2dq_runnable_impl(struct task_struct *p, u64 enq_flags)
-{
-	task_ctx *wakee_ctx;
-
-	if (!(wakee_ctx = lookup_task_ctx(p)))
-		return;
-
-	wakee_ctx->is_kworker = p->flags & (PF_KTHREAD | PF_WQ_WORKER | PF_IO_WORKER);
-}
-
-
-void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
+static __always_inline int p2dq_running_impl(struct task_struct *p)
 {
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc;
@@ -858,15 +920,15 @@ void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
 	s32 task_cpu = scx_bpf_task_cpu(p);
 
 	if (!(taskc = lookup_task_ctx(p)) ||
-	   !(cpuc = lookup_cpu_ctx(task_cpu)) ||
-	   !(llcx = lookup_llc_ctx(cpuc->llc_id)))
-		return;
+	    !(cpuc = lookup_cpu_ctx(task_cpu)) ||
+	    !(llcx = lookup_llc_ctx(cpuc->llc_id)))
+		return -EINVAL;
 
 	if (taskc->llc_id != cpuc->llc_id) {
 		taskc->llc_runs = 0;
 		stat_inc(P2DQ_STAT_LLC_MIGRATION);
 		trace("RUNNING %d cpu %d->%d llc %d->%d",
-		      p->pid, cpuc->id, taskc->cpu,
+		      p->pid, cpuc->id, task_cpu,
 		      taskc->llc_id, llcx->id);
 	} else {
 		taskc->llc_runs += 1;
@@ -879,7 +941,6 @@ void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
 	taskc->node_id = llcx->node_id;
 	cpuc->dsq_index = taskc->dsq_index;
 	cpuc->ran_for = 0;
-	taskc->cpu = task_cpu;
 	// racy, but don't care
 	if (p->scx.dsq_vtime > llcx->vtime) {
 		__sync_val_compare_and_swap(&llcx->vtime, llcx->vtime, p->scx.dsq_vtime);
@@ -889,10 +950,17 @@ void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
 
 	// If the task is running in the least interactive DSQ, bump the
 	// frequency.
-	if (taskc->dsq_index == nr_dsqs_per_llc-1) {
+	if (freq_control && taskc->dsq_index == nr_dsqs_per_llc-1) {
 		scx_bpf_cpuperf_set(task_cpu, SCX_CPUPERF_ONE);
 	}
-	taskc->last_run_at = bpf_ktime_get_ns();
+
+	u64 now = bpf_ktime_get_ns();
+	if (taskc->last_run_started == 0)
+		taskc->last_run_started = now;
+
+	taskc->last_run_at = now;
+
+	return 0;
 }
 
 void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
@@ -917,8 +985,8 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	taskc->last_dsq_index = taskc->dsq_index;
 	taskc->used = 0;
 
-	last_dsq_slice_ns = task_slice_ns(p, taskc->dsq_index);
-	used = min(now - taskc->last_run_at, last_dsq_slice_ns);
+	last_dsq_slice_ns = taskc->slice_ns;
+	used = now - taskc->last_run_at;
 	scaled_used = used * 100 / p->scx.weight;
 
 	p->scx.dsq_vtime += scaled_used;
@@ -931,29 +999,34 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	trace("%s weight %d slice %llu used %llu scaled %llu",
 	      p->comm, p->scx.weight, last_dsq_slice_ns, used, scaled_used);
 
-	// On stopping determine if the task can move to a longer DSQ by
-	// comparing the used time to the scaled DSQ slice.
-	if (used >= ((9 * last_dsq_slice_ns) / 10)) {
-		if (taskc->dsq_index < nr_dsqs_per_llc - 1) {
-			taskc->dsq_index += 1;
-			stat_inc(P2DQ_STAT_DSQ_CHANGE);
-			trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
-			      taskc->last_dsq_index, taskc->dsq_index);
+	if (!runnable) {
+		used = now - taskc->last_run_started;
+		// On stopping determine if the task can move to a longer DSQ by
+		// comparing the used time to the scaled DSQ slice.
+		if (used >= ((9 * last_dsq_slice_ns) / 10)) {
+			if (taskc->dsq_index < nr_dsqs_per_llc - 1) {
+				taskc->dsq_index += 1;
+				stat_inc(P2DQ_STAT_DSQ_CHANGE);
+				trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
+				      taskc->last_dsq_index, taskc->dsq_index);
+			} else {
+				stat_inc(P2DQ_STAT_DSQ_SAME);
+			}
+		// If under half the slice was consumed move the task back down.
+		} else if (used < last_dsq_slice_ns / 2) {
+			if (taskc->dsq_index > 0) {
+				taskc->dsq_index -= 1;
+				stat_inc(P2DQ_STAT_DSQ_CHANGE);
+				trace("%s[%p]: DSQ dec %llu -> %u", p->comm, p,
+				      taskc->last_dsq_index, taskc->dsq_index);
+			} else {
+				stat_inc(P2DQ_STAT_DSQ_SAME);
+			}
 		} else {
 			stat_inc(P2DQ_STAT_DSQ_SAME);
 		}
-	// If under half the slice was consumed move the task back down.
-	} else if (used < last_dsq_slice_ns / 2) {
-		if (taskc->dsq_index > 0) {
-			taskc->dsq_index -= 1;
-			stat_inc(P2DQ_STAT_DSQ_CHANGE);
-			trace("%s[%p]: DSQ dec %llu -> %u", p->comm, p,
-			      taskc->last_dsq_index, taskc->dsq_index);
-		} else {
-			stat_inc(P2DQ_STAT_DSQ_SAME);
-		}
-	} else {
-		stat_inc(P2DQ_STAT_DSQ_SAME);
+		taskc->slice_ns = task_slice_ns(p, taskc->dsq_index);
+		taskc->last_run_started = 0;
 	}
 }
 
@@ -1007,13 +1080,8 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx, 
 		return -EINVAL;
 
 	// Special case when two llcs are present
-	if (nr_llcs == 2) {
-		left = lookup_llc_ctx(0);
-		right = lookup_llc_ctx(1);
-	} else {
-		left = rand_llc_ctx();
-		right = rand_llc_ctx();
-	}
+	left = nr_llcs == 2 ? lookup_llc_ctx(0) : rand_llc_ctx();
+	right = nr_llcs == 2 ? lookup_llc_ctx(1) : rand_llc_ctx();
 
 	// Last ditch effort try consuming from the most loaded DSQ.
 	llcx = pick_two_llc_ctx(cur_llcx, left, right);
@@ -1025,7 +1093,7 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx, 
 	if (!bpf_ksym_exists(scx_bpf_dsq_move)) {
 		// Start with least interactive DSQs to avoid migrating
 		// interactive tasks.
-		bpf_for(i, 1, nr_dsqs_per_llc) {
+		bpf_for(i, dispatch_lb_interactive ? 0 : 1, nr_dsqs_per_llc) {
 			if (scx_bpf_dsq_move_to_local(llcx->dsqs[nr_dsqs_per_llc - i])) {
 				stat_inc(P2DQ_STAT_DISPATCH_PICK2);
 				return 0;
@@ -1034,16 +1102,9 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx, 
 		return 0;
 	}
 
-	// First try any interactive tasks.
-	if (dispatch_lb_interactive) {
-		dsq_id = llcx->dsqs[0];
-		if (dispatch_cpu(dsq_id, cpu, llcx, 0) > 0)
-			return 0;
-	}
-
 	// Then migrate least interactive DSQs to find the most throughput
 	// bound tasks.
-	bpf_for(i, 1, nr_dsqs_per_llc) {
+	bpf_for(i, dispatch_lb_interactive ? 0 : 1, nr_dsqs_per_llc) {
 		dsq_id = llcx->dsqs[nr_dsqs_per_llc - i];
 		if (dispatch_cpu(dsq_id, cpu, llcx, nr_dsqs_per_llc - i) > 0)
 			return 0;
@@ -1061,9 +1122,6 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 
 	if (!(cpuc = lookup_cpu_ctx(cpu)) ||
 	    !(llcx = lookup_llc_ctx(cpuc->llc_id)))
-		return;
-
-	if (prev && keep_running(cpuc, prev))
 		return;
 
 	if (nr_dsqs_per_llc > MAX_DSQS_PER_LLC) {
@@ -1093,6 +1151,9 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 		    scx_bpf_dsq_move_to_local(cpuc->dsqs[i]))
 		    return;
 	}
+
+	if (prev && keep_running(cpuc, llcx, prev))
+		return;
 
 	dispatch_pick_two(cpu, llcx, cpuc);
 }
@@ -1148,13 +1209,12 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 		return -EINVAL;
 	}
 
-	taskc->cpu = task_cpu;
 	taskc->dsq_id = SCX_DSQ_INVALID;
 	taskc->llc_id = cpuc->llc_id;
 	taskc->node_id = cpuc->node_id;
 	taskc->dsq_index = init_dsq_index;
 	taskc->last_dsq_index = init_dsq_index;
-	taskc->runnable = true;
+	taskc->slice_ns = dsq_time_slice(init_dsq_index);
 	taskc->all_cpus = p->cpus_ptr == &p->cpus_mask && p->nr_cpus_allowed == nr_cpus;
 	p->scx.dsq_vtime = llcx->vtime;
 
@@ -1168,7 +1228,7 @@ void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p, struct scx_exit_task_
 
 static int init_llc(u32 llc_id)
 {
-	struct bpf_cpumask *cpumask, *big_cpumask, *little_cpumask;
+	struct bpf_cpumask *cpumask, *big_cpumask, *little_cpumask, *node_cpumask;
 	struct llc_ctx *llcx;
 
 	llcx = bpf_map_lookup_elem(&llc_ctxs, &llc_id);
@@ -1220,6 +1280,18 @@ static int init_llc(u32 llc_id)
 	if (little_cpumask) {
 		scx_bpf_error("kptr already had cpumask");
 		bpf_cpumask_release(little_cpumask);
+	}
+
+	node_cpumask = bpf_cpumask_create();
+	if (!node_cpumask) {
+		scx_bpf_error("failed to create node cpumask");
+		return -ENOMEM;
+	}
+
+	node_cpumask = bpf_kptr_xchg(&llcx->node_cpumask, node_cpumask);
+	if (node_cpumask) {
+		scx_bpf_error("kptr already had node_cpumask");
+		bpf_cpumask_release(node_cpumask);
 	}
 
 	return 0;
@@ -1332,29 +1404,49 @@ static s32 init_cpu(int cpu)
 
 static bool load_balance_timer(void)
 {
-	struct llc_ctx *llcx;
+	struct llc_ctx *llcx, *lb_llcx;
 	int llc_id, j;
 	u64 ideal_sum, load_sum = 0, interactive_sum = 0;
 
-	if (nr_llcs == 1 && !autoslice)
+	if (nr_llcs == 1)
 		return false;
 
-	if (!autoslice)
-		goto reset_load;
-
 	bpf_for(llc_id, 0, nr_llcs) {
-		if (!(llcx = lookup_llc_ctx(llc_id)))
+		if (!(llcx = lookup_llc_ctx(llc_id))) {
+			scx_bpf_error("failed to lookup llc %d", llc_id);
 			return false;
-
-		bpf_for(j, 0, nr_dsqs_per_llc) {
-			load_sum += llcx->dsq_load[j];
-			if (j == 0)
-				interactive_sum += llcx->dsq_load[j];
 		}
-	}
-	dbg("load %llu interactive %llu", load_sum, interactive_sum);
 
-	if (load_sum == 0 || load_sum < interactive_sum)
+		u32 lb_llc_id = (llc_id + llc_lb_offset) % nr_llcs;
+		if (!(lb_llcx = lookup_llc_ctx(lb_llc_id))) {
+			scx_bpf_error("failed to lookup lb llc %d", lb_llc_id);
+			return false;
+		}
+
+		load_sum += llcx->load;
+		interactive_sum += llcx->dsq_load[0];
+
+		s64 load_imbalance = 0;
+		if(llcx->load > lb_llcx->load)
+			load_imbalance = (100 * (llcx->load - lb_llcx->load)) / llcx->load;
+
+		u32 lb_slack = (lb_slack_factor > 0 ? lb_slack_factor : LOAD_BALANCE_SLACK);
+
+		if (load_imbalance > lb_slack)
+			llcx->lb_llc_id = lb_llc_id;
+		else
+			llcx->lb_llc_id = MAX_LLCS;
+
+		dbg("LB llcx[%u] %llu lb_llcx[%u] %llu imbalance %lli",
+		    llc_id, llcx->load, lb_llc_id, lb_llcx->load, load_imbalance);
+	}
+
+	dbg("LB Total load %llu, Total interactive %llu",
+	    load_sum, interactive_sum);
+
+	llc_lb_offset = (llc_lb_offset % (nr_llcs - 1)) + 1;
+
+	if (!autoslice || load_sum == 0 || load_sum < interactive_sum)
 		goto reset_load;
 
 	if (interactive_sum == 0) {
@@ -1364,7 +1456,7 @@ static bool load_balance_timer(void)
 		}
 	} else {
 		ideal_sum = (load_sum * interactive_ratio) / 100;
-		dbg("ideal/sum %llu/%llu", ideal_sum, interactive_sum);
+		dbg("LB autoslice ideal/sum %llu/%llu", ideal_sum, interactive_sum);
 		if (interactive_sum < ideal_sum) {
 			dsq_time_slices[0] = (11 * dsq_time_slices[0]) / 10;
 
@@ -1395,7 +1487,7 @@ reset_load:
 				if (j > 0 && dsq_time_slices[j] < dsq_time_slices[j-1]) {
 					dsq_time_slices[j] = dsq_time_slices[j-1] << dsq_shift;
 				}
-				dbg("interactive slice %llu", dsq_time_slices[j]);
+				dbg("LB autoslice interactive slice %llu", dsq_time_slices[j]);
 			}
 		}
 	}
@@ -1557,6 +1649,15 @@ static __always_inline s32 p2dq_init_impl()
 		    !(llcx = lookup_llc_ctx(cpuc->llc_id)))
 			return -EINVAL;
 
+		if (cpuc &&
+		    llcx->node_cpumask &&
+		    llcx->node_id == cpuc->node_id) {
+			bpf_rcu_read_lock();
+			if (llcx->node_cpumask)
+				bpf_cpumask_set_cpu(cpuc->id, llcx->node_cpumask);
+			bpf_rcu_read_unlock();
+		}
+
 		bpf_for(dsq_id, 0, nr_dsqs_per_llc) {
 			cpuc->dsqs[dsq_id] = llcx->dsqs[dsq_id];
 		}
@@ -1567,10 +1668,6 @@ static __always_inline s32 p2dq_init_impl()
 	if (start_timers() < 0)
 		return -EINVAL;
 
-	ret = scx_task_init(sizeof(task_ctx));
-	if (ret)
-		return ret;
-
 	return 0;
 }
 
@@ -1580,14 +1677,14 @@ void BPF_STRUCT_OPS(p2dq_exit, struct scx_exit_info *ei)
 }
 
 #if P2DQ_CREATE_STRUCT_OPS
-void BPF_STRUCT_OPS(p2dq_runnable, struct task_struct *p, u64 enq_flags)
-{
-	return p2dq_runnable_impl(p, enq_flags);
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(p2dq_init)
 {
 	return p2dq_init_impl();
+}
+
+void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
+{
+	p2dq_running_impl(p);
 }
 
 void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_flags)
@@ -1617,7 +1714,6 @@ SCX_OPS_DEFINE(p2dq,
 	       .select_cpu		= (void *)p2dq_select_cpu,
 	       .enqueue			= (void *)p2dq_enqueue,
 	       .dispatch		= (void *)p2dq_dispatch,
-	       .runnable		= (void *)p2dq_runnable,
 	       .running			= (void *)p2dq_running,
 	       .stopping		= (void *)p2dq_stopping,
 	       .set_cpumask		= (void *)p2dq_set_cpumask,

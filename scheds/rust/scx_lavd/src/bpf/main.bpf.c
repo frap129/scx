@@ -214,11 +214,11 @@ const volatile u64	slice_max_ns = LAVD_SLICE_MAX_NS_DFL;
 #include "util.bpf.c"
 #include "power.bpf.c"
 #include "introspec.bpf.c"
-#include "sys_stat.bpf.c"
 #include "preempt.bpf.c"
 #include "lock.bpf.c"
 #include "idle.bpf.c"
 #include "balance.bpf.c"
+#include "sys_stat.bpf.c"
 
 static u32 calc_greedy_ratio(struct task_ctx *taskc)
 {
@@ -247,7 +247,6 @@ static u32 calc_greedy_factor(u32 greedy_ratio)
 	 * For over-utilized tasks, we give some mild penalty.
 	 */
 	return LAVD_SCALE + ((greedy_ratio - LAVD_SCALE) / LAVD_LC_GREEDY_PENALTY);
-
 }
 
 static inline u64 calc_runtime_factor(u64 runtime)
@@ -395,15 +394,10 @@ static u64 calc_adjusted_runtime(struct task_ctx *taskc)
 	 * (acc_runtime) task. To avoid the starvation of CPU-bound tasks,
 	 * which rarely sleep, limit the impact of acc_runtime.
 	 */
-	runtime = taskc->avg_runtime +
+	runtime = LAVD_ACC_RUNTIME_MAX +
 		  min(taskc->acc_runtime, LAVD_ACC_RUNTIME_MAX);
 
-	/*
-	 * Convert highly skewed runtime distribution to
-	 * mildly skewed distribution.
-	 */
-	u64 adj_runtime = log2_u64(runtime + 1);
-	return adj_runtime * adj_runtime;
+	return runtime;
 }
 
 static u64 calc_virtual_deadline_delta(struct task_struct *p,
@@ -630,7 +624,7 @@ static void update_stat_for_stopping(struct task_struct *p,
 
 	/*
 	 * Increase total scaled CPU time of this CPU,
-	 * whcih is capacity and frequency invariant.
+	 * which is capacity and frequency invariant.
 	 */
 	cpuc->tot_sc_time += scale_cap_freq(task_runtime, cpuc->cpu_id);
 
@@ -685,7 +679,7 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 		 */
 		cpuc = get_cpu_ctx_id(cpu_id);
 		if (!cpuc) {
-			scx_bpf_error("Failed to look up cpu context context");
+			scx_bpf_error("Failed to look up cpu context");
 			return cpu_id;
 		}
 		dsq_id = cpuc->cpdom_id;
@@ -710,9 +704,7 @@ static bool can_direct_dispatch(u64 dsq_id, s32 cpu, bool is_idle)
 	 * If the chosen CPU is idle and there is nothing to do
 	 * in the domain, we can safely choose the fast track.
 	 */
-	if (is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id))
-		return true;
-	return false;
+	return is_idle && cpu >= 0 && !scx_bpf_dsq_nr_queued(dsq_id);
 }
 
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
@@ -985,8 +977,10 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	 * Clear the accumulated runtime.
 	 */
 	p_taskc = get_task_ctx(p);
-	if (!p_taskc)
+	if (!p_taskc) {
+		scx_bpf_error("Failed to lookup task_ctx for task");
 		return;
+	}
 	p_taskc->acc_runtime = 0;
 
 	/*
@@ -1036,8 +1030,10 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
-	if (!cpuc || !taskc)
+	if (!cpuc || !taskc) {
+		scx_bpf_error("Failed to lookup context for task %d", p->pid);
 		return;
+	}
 
 	update_stat_for_running(p, taskc, cpuc, now);
 
@@ -1076,8 +1072,10 @@ void BPF_STRUCT_OPS(lavd_stopping, struct task_struct *p, bool runnable)
 	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
-	if (!cpuc || !taskc)
+	if (!cpuc || !taskc) {
+		scx_bpf_error("Failed to lookup context for task %d", p->pid);
 		return;
+	}
 
 	update_stat_for_stopping(p, taskc, cpuc);
 }
@@ -1093,8 +1091,10 @@ void BPF_STRUCT_OPS(lavd_quiescent, struct task_struct *p, u64 deq_flags)
 	 */
 	cpuc = get_cpu_ctx_task(p);
 	taskc = get_task_ctx(p);
-	if (!cpuc || !taskc)
+	if (!cpuc || !taskc) {
+		scx_bpf_error("Failed to lookup context for task %d ", p->pid);
 		return;
+	}
 
 	/*
 	 * If a task @p is dequeued from a run queue for some other reason
@@ -1165,8 +1165,10 @@ void BPF_STRUCT_OPS(lavd_cpu_online, s32 cpu)
 	struct cpu_ctx *cpuc;
 
 	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc)
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
+	}
 
 	cpu_ctx_init_online(cpuc, cpu, now);
 
@@ -1184,8 +1186,10 @@ void BPF_STRUCT_OPS(lavd_cpu_offline, s32 cpu)
 	struct cpu_ctx *cpuc;
 
 	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc)
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
+	}
 
 	cpu_ctx_init_offline(cpuc, cpu, now);
 
@@ -1205,8 +1209,10 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 	u64 now;
 
 	cpuc = get_cpu_ctx_id(cpu);
-	if (!cpuc)
+	if (!cpuc) {
+		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
+	}
 
 	now = scx_bpf_now();
 
@@ -1369,10 +1375,19 @@ s32 BPF_STRUCT_OPS(lavd_init_task, struct task_struct *p,
 	 * When @p becomes under the SCX control (e.g., being forked), @p's
 	 * context data is initialized. We can sleep in this function and the
 	 * following will automatically use GFP_KERNEL.
+	 * 
+	 * Return 0 on success.
+	 * Return -ESRCH if @p is invalid.
+	 * Return -ENOMEM if context allocation fails.
 	 */
+	if (!p) {
+		scx_bpf_error("NULL task_struct pointer received");
+		return -ESRCH;
+	}
+	
 	taskc = bpf_task_storage_get(&task_ctx_stor, p, 0,
 				     BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (!taskc || !p) {
+	if (!taskc) {
 		scx_bpf_error("task_ctx_stor first lookup failed");
 		return -ENOMEM;
 	}
@@ -1632,10 +1647,11 @@ static s32 init_per_cpu_ctx(u64 now)
 					cpuc->cpdom_id = cpdomc->id;
 					cpuc->cpdom_alt_id = cpdomc->alt_id;
 
-					if (bpf_cpumask_test_cpu(cpu, online_cpumask))
+					if (bpf_cpumask_test_cpu(cpu, online_cpumask)) {
 						bpf_cpumask_set_cpu(cpu, cd_cpumask);
-					if (bpf_cpumask_test_cpu(cpu, cast_mask(active)))
-						WRITE_ONCE(cpdomc->is_active, true);
+						cpdomc->nr_active_cpus++;
+						cpdomc->cap_sum_active_cpus += cpuc->capacity;
+					}
 					cpdomc->nr_cpus++;
 				}
 			}

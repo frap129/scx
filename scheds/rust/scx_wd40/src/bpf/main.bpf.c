@@ -39,21 +39,17 @@
  * load balance based on userspace's setting of the target_dom field.
  */
 
-#ifdef LSP
-#define __bpf__
-#include "../../../../include/scx/common.bpf.h"
-#include "../../../../include/scx/ravg_impl.bpf.h"
-#else
 #include <scx/common.bpf.h>
-#include <scx/ravg_impl.bpf.h>
-#include <lib/sdt_task.h>
-#endif
 
 #include <scx/bpf_arena_common.h>
 #include <scx/bpf_arena_spin_lock.h>
+#include <scx/ravg_impl.bpf.h>
 
+#include <lib/arena.h>
 #include <lib/cpumask.h>
 #include <lib/percpu.h>
+#include <lib/topology.h>
+#include <lib/sdt_task.h>
 
 #include "intf.h"
 #include "types.h"
@@ -79,7 +75,6 @@ UEI_DEFINE(uei);
 /*
  * Domains and cpus
  */
-const volatile u32 nr_cpu_ids = 64;	/* !0 for veristat, set during init */
 const volatile u32 cpu_dom_id_map[MAX_CPUS];
 const volatile u32 wd40_perf_mode;
 
@@ -853,22 +848,9 @@ static s32 initialize_cpu(s32 cpu)
 }
 
 SEC("syscall")
-int wd40_arena_setup(void)
+int wd40_setup(void)
 {
 	int ret, i;
-
-	ret = scx_static_init(STATIC_ALLOC_PAGES_GRANULARITY);
-	if (ret)
-		return ret;
-
-	/* How many types to store all CPU IDs? */
-	ret = scx_bitmap_init(div_round_up(nr_cpu_ids, 8));
-	if (ret)
-		return ret;
-
-	ret = scx_percpu_storage_init();
-	if (ret)
-		return ret;
 
 	ret = create_save_scx_bitmap(&all_cpumask);
 	if (ret)
@@ -883,10 +865,6 @@ int wd40_arena_setup(void)
 		return ret;
 
 	ret = lb_domain_init();
-	if (ret)
-		return ret;
-
-	ret = scx_task_init(sizeof(struct task_ctx));
 	if (ret)
 		return ret;
 
@@ -907,6 +885,11 @@ int wd40_arena_setup(void)
 		ret = alloc_dom(i);
 		if (ret)
 			return ret;
+	}
+
+	if (debug) {
+		topo_print();
+		topo_print_by_level();
 	}
 
 	return 0;

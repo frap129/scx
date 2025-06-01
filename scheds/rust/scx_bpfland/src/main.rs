@@ -135,6 +135,13 @@ struct Opts {
     #[clap(short = 'l', long, allow_hyphen_values = true, default_value = "20000")]
     slice_us_lag: i64,
 
+    /// Throttle the running CPUs by periodically injecting idle cycles.
+    ///
+    /// This option can help extend battery life on portable devices, reduce heating, fan noise
+    /// and overall energy consumption (0 = disable).
+    #[clap(short = 't', long, default_value = "0")]
+    throttle_us: u64,
+
     /// Set CPU idle QoS resume latency in microseconds (-1 = disabled).
     ///
     /// Setting a lower latency value makes CPUs less likely to enter deeper idle states, enhancing
@@ -303,12 +310,16 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.smt_enabled = smt_enabled;
         skel.maps.rodata_data.numa_disabled = opts.disable_numa;
         skel.maps.rodata_data.local_pcpu = opts.local_pcpu;
-        skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
         skel.maps.rodata_data.no_preempt = opts.no_preempt;
         skel.maps.rodata_data.no_wake_sync = opts.no_wake_sync;
         skel.maps.rodata_data.slice_max = opts.slice_us * 1000;
         skel.maps.rodata_data.slice_min = opts.slice_us_min * 1000;
         skel.maps.rodata_data.slice_lag = opts.slice_us_lag * 1000;
+        skel.maps.rodata_data.throttle_ns = opts.throttle_us * 1000;
+
+        // Implicitly enable direct dispatch of per-CPU kthreads if CPU throttling is enabled
+        // (it's never a good idea to throttle per-CPU kthreads).
+        skel.maps.rodata_data.local_kthreads = opts.local_kthreads || opts.throttle_us > 0;
 
         // Set scheduler compatibility flags.
         skel.maps.rodata_data.__COMPAT_SCX_PICK_IDLE_IN_NODE = *compat::SCX_PICK_IDLE_IN_NODE;
@@ -328,7 +339,7 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
 
         // Initialize the primary scheduling domain and the preferred domain.
-        let power_profile = fetch_power_profile(false);
+        let power_profile = Self::power_profile();
         if let Err(err) = Self::init_energy_domain(&mut skel, &opts.primary_domain, power_profile) {
             warn!("failed to initialize primary domain: error {}", err);
         }
@@ -408,9 +419,11 @@ impl<'a> Scheduler<'a> {
             "performance" => Self::epp_to_cpumask(Powermode::Performance)?,
             "auto" => match power_profile {
                 PowerProfile::Powersave => Self::epp_to_cpumask(Powermode::Powersave)?,
-                PowerProfile::Performance | PowerProfile::Balanced => {
-                    Self::epp_to_cpumask(Powermode::Performance)?
+                PowerProfile::Balanced { power: true } => {
+                    Self::epp_to_cpumask(Powermode::Powersave)?
                 }
+                PowerProfile::Balanced { power: false } => Self::epp_to_cpumask(Powermode::Any)?,
+                PowerProfile::Performance => Self::epp_to_cpumask(Powermode::Any)?,
                 PowerProfile::Unknown => Self::epp_to_cpumask(Powermode::Any)?,
             },
             "all" => Self::epp_to_cpumask(Powermode::Any)?,
@@ -462,9 +475,18 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    fn power_profile() -> PowerProfile {
+        let profile = fetch_power_profile(true);
+        if profile == PowerProfile::Unknown {
+            fetch_power_profile(false)
+        } else {
+            profile
+        }
+    }
+
     fn refresh_sched_domain(&mut self) -> bool {
         if self.power_profile != PowerProfile::Unknown {
-            let power_profile = fetch_power_profile(false);
+            let power_profile = Self::power_profile();
             if power_profile != self.power_profile {
                 self.power_profile = power_profile;
 
@@ -577,14 +599,11 @@ impl<'a> Scheduler<'a> {
             );
             for cpu in &cpus {
                 for sibling_cpu in &cpus {
-                    match enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu) {
-                        Ok(()) => {}
-                        Err(_) => {
-                            warn!(
-                                "L{} cache ID {}: failed to set CPU {} sibling {}",
-                                cache_lvl, cache_id, *cpu, *sibling_cpu
-                            );
-                        }
+                    if enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu).is_err() {
+                        warn!(
+                            "L{} cache ID {}: failed to set CPU {} sibling {}",
+                            cache_lvl, cache_id, *cpu, *sibling_cpu
+                        );
                     }
                 }
             }
@@ -639,7 +658,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        self.struct_ops.take();
+        let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
 }
