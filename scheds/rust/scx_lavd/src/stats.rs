@@ -7,7 +7,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use anyhow::bail;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gpoint::GPoint;
 use scx_stats::prelude::*;
 use scx_stats_derive::stat_doc;
@@ -64,7 +64,7 @@ pub struct SysStats {
     #[stat(desc = "% of balanced mode")]
     pub pc_balanced: f64,
 
-    #[stat(desc = "% of powersave powersave")]
+    #[stat(desc = "% of powersave mode")]
     pub pc_powersave: f64,
 }
 
@@ -72,7 +72,7 @@ impl SysStats {
     pub fn format_header<W: Write>(w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "\x1b[93m| {:8} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
+            "\x1b[93m| {:8} | {:9} | {:9} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
             "MSEQ",
             "# Q TASK",
             "# ACT CPU",
@@ -98,9 +98,15 @@ impl SysStats {
             Self::format_header(w)?;
         }
 
+        let color = if self.mseq % 2 == 0 {
+            "\x1b[90m" // Dark gray for even mseq
+        } else {
+            "\x1b[37m" // white for odd mseq
+        };
+
         writeln!(
             w,
-            "| {:8} | {:9} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |",
+            "{color}| {:8} | {:9} | {:9} | {:8} | {:9} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:8} | {:11} | {:12} | {:12} | {:12} |\x1b[0m",
             self.mseq,
             self.nr_queued_task,
             self.nr_active,
@@ -133,7 +139,7 @@ pub struct SchedSample {
     #[stat(desc = "Task name")]
     pub comm: String,
     #[stat(
-        desc = "LR: 'L'atency-critical or 'R'egular, HI: performance-'H'ungry or performance-'I'nsensitive, BT: 'B'ig or li'T'tle, EG: 'E'ligigle or 'G'reedy, PN: 'P'reempting or 'N'ot"
+        desc = "LR: 'L'atency-critical or 'R'egular, HI: performance-'H'ungry or performance-'I'nsensitive, BT: 'B'ig or li'T'tle, EG: 'E'ligible or 'G'reedy, PN: 'P'reempting or 'N'ot"
     )]
     pub stat: String,
     #[stat(desc = "CPU id where this task is scheduled on")]
@@ -291,7 +297,7 @@ pub fn server_data(nr_cpus_onln: u64) -> StatsServerData<StatsReq, StatsRes> {
         req_ch.send(StatsReq::NewSampler(tid))?;
         match res_ch.recv()? {
             StatsRes::Ack => {}
-            res => bail!("invalid response: {:?}", &res),
+            res => bail!("invalid response: {:?}", res),
         }
 
         let read: Box<dyn StatsReader<StatsReq, StatsRes>> =
@@ -302,7 +308,7 @@ pub fn server_data(nr_cpus_onln: u64) -> StatsServerData<StatsReq, StatsRes> {
                 let stats = match res_ch.recv()? {
                     StatsRes::SysStats(v) => v,
                     StatsRes::Bye => bail!("preempted by another sampler"),
-                    res => bail!("invalid response: {:?}", &res),
+                    res => bail!("invalid response: {:?}", res),
                 };
 
                 stats.to_json()
@@ -316,7 +322,7 @@ pub fn server_data(nr_cpus_onln: u64) -> StatsServerData<StatsReq, StatsRes> {
             req_ch.send(StatsReq::NewSampler(tid))?;
             match res_ch.recv()? {
                 StatsRes::Ack => {}
-                res => bail!("invalid response: {:?}", &res),
+                res => bail!("invalid response: {:?}", res),
             }
 
             let read: Box<dyn StatsReader<StatsReq, StatsRes>> =
@@ -327,7 +333,7 @@ pub fn server_data(nr_cpus_onln: u64) -> StatsServerData<StatsReq, StatsRes> {
                     let samples = match res_ch.recv()? {
                         StatsRes::SchedSamples(v) => v,
                         StatsRes::Bye => bail!("preempted by another sampler"),
-                        res => bail!("invalid response: {:?}", &res),
+                        res => bail!("invalid response: {:?}", res),
                     };
 
                     samples.to_json()
@@ -371,6 +377,11 @@ pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
         &vec![],
         intv,
         || shutdown.load(Ordering::Relaxed),
-        |sysstats| sysstats.format(&mut std::io::stdout()),
+        |sysstats| {
+            sysstats
+                .format(&mut std::io::stdout())
+                .context("failed to format sysstats")?;
+            Ok(())
+        },
     )
 }

@@ -9,21 +9,20 @@ pub mod bpf_intf;
 pub mod stats;
 use stats::Metrics;
 
-use scx_p2dq::SchedulerOpts;
-use scx_p2dq::TOPO;
-
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::MapCore as _;
 use libbpf_rs::OpenObject;
+use libbpf_rs::ProgramInput;
 use log::{debug, info, warn};
 use scx_stats::prelude::*;
 use scx_utils::build_id;
@@ -35,21 +34,28 @@ use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
+use scx_utils::NR_CPU_IDS;
+use scx_utils::{Core, Llc};
 
-use crate::bpf_intf::stat_idx_P2DQ_NR_STATS;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_DIRECT;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_DISPATCH_PICK2;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_DSQ_CHANGE;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_DSQ_SAME;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_IDLE;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_KEEP;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_LLC_MIGRATION;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_NODE_MIGRATION;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_SELECT_PICK2;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_LLC;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_MIG;
-use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_PREV;
+use std::ffi::c_ulong;
+
+use bpf_intf::stat_idx_P2DQ_NR_STATS;
+use bpf_intf::stat_idx_P2DQ_STAT_DIRECT;
+use bpf_intf::stat_idx_P2DQ_STAT_DISPATCH_PICK2;
+use bpf_intf::stat_idx_P2DQ_STAT_DSQ_CHANGE;
+use bpf_intf::stat_idx_P2DQ_STAT_DSQ_SAME;
+use bpf_intf::stat_idx_P2DQ_STAT_IDLE;
+use bpf_intf::stat_idx_P2DQ_STAT_KEEP;
+use bpf_intf::stat_idx_P2DQ_STAT_LLC_MIGRATION;
+use bpf_intf::stat_idx_P2DQ_STAT_NODE_MIGRATION;
+use bpf_intf::stat_idx_P2DQ_STAT_SELECT_PICK2;
+use bpf_intf::stat_idx_P2DQ_STAT_WAKE_LLC;
+use bpf_intf::stat_idx_P2DQ_STAT_WAKE_MIG;
+use bpf_intf::stat_idx_P2DQ_STAT_WAKE_PREV;
+use scx_p2dq::SchedulerOpts;
+use scx_p2dq::TOPO;
 
 /// scx_p2dq: A pick 2 dumb queuing load balancing scheduler.
 ///
@@ -83,6 +89,7 @@ struct CliOpts {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
+    verbose: u8,
 
     stats_server: StatsServer<(), Metrics>,
 }
@@ -102,6 +109,7 @@ impl<'a> Scheduler<'a> {
             build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
         let mut open_skel = scx_ops_open!(skel_builder, open_object, p2dq).unwrap();
+        open_skel.maps.rodata_data.nr_cpu_ids = *NR_CPU_IDS as u32;
         scx_p2dq::init_open_skel!(&mut open_skel, opts, verbose)?;
 
         match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
@@ -110,17 +118,15 @@ impl<'a> Scheduler<'a> {
         };
 
         let mut skel = scx_ops_load!(open_skel, p2dq, uei)?;
-        scx_p2dq::init_skel!(&mut skel);
 
-        let struct_ops = Some(scx_ops_attach!(skel, p2dq)?);
+        scx_p2dq::init_skel!(&mut skel);
 
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
-        info!("P2DQ scheduler started! Run `scx_p2dq --monitor` for metrics.");
-
         Ok(Self {
             skel,
-            struct_ops,
+            struct_ops: None,
+            verbose,
             stats_server,
         })
     }
@@ -156,6 +162,126 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    fn setup_arenas(&mut self) -> Result<()> {
+        // Allocate the arena memory from the BPF side so userspace initializes it before starting
+        // the scheduler. Despite the function call's name this is neither a test nor a test run,
+        // it's the recommended way of executing SEC("syscall") probes.
+        let mut args = types::arena_init_args {
+            static_pages: bpf_intf::consts_STATIC_ALLOC_PAGES_GRANULARITY as c_ulong,
+            task_ctx_size: std::mem::size_of::<types::task_p2dq>() as c_ulong,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.arena_init.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas, p2dq_setup returned {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
+    }
+
+    fn setup_topology_node(&mut self, mask: &[u64]) -> Result<()> {
+        let mut args = types::arena_alloc_mask_args {
+            bitmap: 0 as c_ulong,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.arena_alloc_mask.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas, setup_topology_node returned {}",
+                output.return_value as i32
+            );
+        }
+
+        let ptr = unsafe { std::mem::transmute::<u64, &mut [u64; 10]>(args.bitmap) };
+
+        let (valid_mask, _) = ptr.split_at_mut(mask.len());
+        valid_mask.clone_from_slice(mask);
+
+        let mut args = types::arena_topology_node_init_args {
+            bitmap: args.bitmap as c_ulong,
+            data_size: 0 as c_ulong,
+            id: 0 as c_ulong,
+        };
+
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.arena_topology_node_init.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "p2dq_topology_node_init returned {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
+    }
+
+    fn setup_topology(&mut self) -> Result<()> {
+        let topo = Topology::new().expect("Failed to build host topology");
+
+        self.setup_topology_node(topo.span.as_raw_slice())?;
+
+        for (_, node) in topo.nodes {
+            self.setup_topology_node(node.span.as_raw_slice())?;
+        }
+
+        for (_, llc) in topo.all_llcs {
+            self.setup_topology_node(
+                Arc::<Llc>::into_inner(llc)
+                    .expect("missing llc")
+                    .span
+                    .as_raw_slice(),
+            )?;
+        }
+
+        for (_, core) in topo.all_cores {
+            self.setup_topology_node(
+                Arc::<Core>::into_inner(core)
+                    .expect("missing core")
+                    .span
+                    .as_raw_slice(),
+            )?;
+        }
+        for (_, cpu) in topo.all_cpus {
+            let mut mask = [0; 9];
+            mask[cpu.id.checked_shr(64).unwrap_or(0)] |= 1 << (cpu.id % 64);
+            self.setup_topology_node(&mask)?;
+        }
+
+        Ok(())
+    }
+
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
 
@@ -167,8 +293,39 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        self.struct_ops.take();
+        let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
+    }
+
+    fn print_topology(&mut self) -> Result<()> {
+        let input = ProgramInput {
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.arena_topology_print.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Could not initialize arenas, topo_print returned {}",
+                output.return_value as i32
+            );
+        }
+
+        Ok(())
+    }
+
+    fn start(&mut self) -> Result<()> {
+        self.setup_arenas()?;
+        self.setup_topology()?;
+
+        self.struct_ops = Some(scx_ops_attach!(self.skel, p2dq)?);
+
+        if self.verbose > 1 {
+            self.print_topology()?;
+        }
+
+        info!("P2DQ scheduler started! Run `scx_p2dq --monitor` for metrics.");
+
+        Ok(())
     }
 }
 
@@ -197,7 +354,9 @@ fn main() -> Result<()> {
         _ => simplelog::LevelFilter::Trace,
     };
     let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_level(simplelog::LevelFilter::Error)
+    lcfg.set_time_offset_to_local()
+        .unwrap()
+        .set_time_level(simplelog::LevelFilter::Error)
         .set_location_level(simplelog::LevelFilter::Off)
         .set_target_level(simplelog::LevelFilter::Off)
         .set_thread_level(simplelog::LevelFilter::Off);
@@ -252,6 +411,8 @@ fn main() -> Result<()> {
     let mut open_object = MaybeUninit::uninit();
     loop {
         let mut sched = Scheduler::init(&opts.sched, &mut open_object, opts.verbose)?;
+        sched.start()?;
+
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }

@@ -9,6 +9,8 @@
 /*
  * common macros
  */
+#define U64_MAX		((u64)~0U)
+#define S64_MAX		((s64)(U64_MAX >> 1))
 #define U32_MAX		((u32)~0U)
 #define S32_MAX		((s32)(U32_MAX >> 1))
 
@@ -31,15 +33,14 @@ enum consts_internal  {
 	LAVD_MAX_RETRY			= 3,
 
 	LAVD_TARGETED_LATENCY_NS	= (20ULL * NSEC_PER_MSEC),
-	LAVD_SLICE_MIN_NS_DFL		= (300ULL * NSEC_PER_USEC), /* min time slice */
+	LAVD_SLICE_MIN_NS_DFL		= (500ULL * NSEC_PER_USEC), /* min time slice */
 	LAVD_SLICE_MAX_NS_DFL		= (5ULL * NSEC_PER_MSEC), /* max time slice */
-	LAVD_ACC_RUNTIME_MAX		= (LAVD_TARGETED_LATENCY_NS * 10),
+	LAVD_ACC_RUNTIME_MAX		= LAVD_SLICE_MAX_NS_DFL,
 
 	LAVD_LC_FREQ_MAX		= 1000000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
 	LAVD_LC_WEIGHT_BOOST		= 128, /* 2^7 */
 	LAVD_LC_GREEDY_PENALTY		= p2s(20),  /* 20% */
-	LAVD_LC_PREEMPT_SHIFT		= 6, /* roughly top 1.56% for preemption. */
 
 	LAVD_CPU_UTIL_MAX_FOR_CPUPERF	= p2s(85), /* 85.0% */
 
@@ -55,9 +56,10 @@ enum consts_internal  {
 	LAVD_AP_HIGH_UTIL		= p2s(70), /* 70%: balanced mode when 10% < cpu util <= 70%,
 							  performance mode when cpu util > 70% */
 
-	LAVD_CPDOM_MIGRATION_SHIFT	= 3, /* 1/2**3 = +/- 12.5% */
-	LAVD_CPDOM_X_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS /
-					   (2 * LAVD_SLICE_MAX_NS_DFL)), /* roughly twice per interval */
+	LAVD_CPDOM_MIG_SHIFT_UL		= 2, /* when under-loaded:  1/2**2 = [-25.0%, +25.0%] */
+	LAVD_CPDOM_MIG_SHIFT		= 3, /* when midely loaded: 1/2**3 = [-12.5%, +12.5%] */
+	LAVD_CPDOM_MIG_SHIFT_OL		= 4, /* when over-loaded:   1/2**4 = [-6.25%, +6.25%] */
+	LAVD_CPDOM_MIG_PROB_FT		= (LAVD_SYS_STAT_INTERVAL_NS / (2 * LAVD_SLICE_MAX_NS_DFL)), /* roughly twice per interval */
 
 	LAVD_FUTEX_OP_INVALID		= -1,
 };
@@ -72,11 +74,16 @@ struct cpdom_ctx {
 	u8	node_id;			    /* numa domain id */
 	u8	is_big;				    /* is it a big core or little core? */
 	u8	is_valid;			    /* is this a valid compute domain? */
-	u8	is_active;			    /* is there an active CPU in this domain? */
 	u8	is_stealer;			    /* this domain should steal tasks from others */
 	u8	is_stealee;			    /* stealer doamin should steal tasks from this domain */
 	u16	nr_cpus;			    /* the number of CPUs in this compute domain */
-	u32	nr_q_tasks_per_cpu;		    /* the number of queued tasks per CPU in this domain (x1000) */
+	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
+	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
+	u32	sc_load;			    /* scaled load considering DSQ length and CPU utilization */
+	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
+	u32	cur_util_sum;			    /* the sum of CPU utilization in the current interval */
+	u32	cap_sum_active_cpus;		    /* the sum of capacities of active CPUs in this domain */
+	u32	cap_sum_temp;			    /* temp for cap_sum_active_cpus */
 	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];  /* number of neighbors per distance */
 	u64	neighbor_bits[LAVD_CPDOM_MAX_DIST]; /* bitmask of neighbor bitmask per distance */
 	u64	__cpumask[LAVD_CPU_ID_MAX/64];	    /* cpumasks belongs to this compute domain */

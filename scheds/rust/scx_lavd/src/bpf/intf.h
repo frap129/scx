@@ -51,7 +51,7 @@ enum {
 	LAVD_CPU_ID_MAX			= 512,
 
 	LAVD_CPDOM_MAX_NR		= 16, /* maximum number of compute domain */
-	LAVD_CPDOM_MAX_DIST		= 4,  /* maximum distance from one compute domain to another */
+	LAVD_CPDOM_MAX_DIST		= 3,  /* maximum distance from one compute domain to another */
 
 	LAVD_STATUS_STR_LEN		= 4, /* {LR: Latency-critical, Regular}
 						{HI: performance-Hungry, performance-Insensitive}
@@ -82,7 +82,8 @@ struct sys_stat {
 	u32	thr_perf_cri;	/* performance criticality threshold */
 
 	u32	nr_stealee;	/* number of compute domains to be migrated */
-	u32	nr_active;	/* number of active cores */
+	u32	nr_active;	/* number of active CPUs */
+	u32	nr_active_cpdoms; /* number of active compute domains */
 
 	u64	nr_sched;	/* total scheduling so far */
 	u64	nr_preempt;	/* total number of preemption operations triggered */

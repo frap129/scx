@@ -28,6 +28,8 @@ enum chaos_match {
 enum chaos_trait_kind {
 	CHAOS_TRAIT_NONE,
 	CHAOS_TRAIT_RANDOM_DELAYS,
+	CHAOS_TRAIT_CPU_FREQ,
+	CHAOS_TRAIT_DEGRADATION,
 	CHAOS_TRAIT_MAX,
 };
 

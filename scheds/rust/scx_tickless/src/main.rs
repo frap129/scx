@@ -157,7 +157,8 @@ impl<'a> Scheduler<'a> {
         // Load the BPF program for validation.
         let mut skel = scx_ops_load!(skel, tickless_ops, uei)?;
 
-        // Set task affinity to the first primary CPU.
+        // Set task affinity to the first primary CPU: this is required to start the scheduler's
+        // timer on a primary CPU.
         let timer_cpu = domain.iter().next();
         if timer_cpu.is_none() {
             bail!("primary cpumask is empty");
@@ -250,7 +251,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        self.struct_ops.take();
+        let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
 }
@@ -281,7 +282,9 @@ fn main() -> Result<()> {
     let loglevel = simplelog::LevelFilter::Info;
 
     let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_level(simplelog::LevelFilter::Error)
+    lcfg.set_time_offset_to_local()
+        .unwrap()
+        .set_time_level(simplelog::LevelFilter::Error)
         .set_location_level(simplelog::LevelFilter::Off)
         .set_target_level(simplelog::LevelFilter::Off)
         .set_thread_level(simplelog::LevelFilter::Off);

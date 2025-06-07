@@ -12,6 +12,8 @@ use serde::Serialize;
 use crate::bpf_intf;
 use crate::LayerGrowthAlgo;
 
+use scx_utils::Cpumask;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LayerConfig {
@@ -21,7 +23,10 @@ pub struct LayerConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerSpec {
     pub name: String,
+    #[serde(skip)]
+    pub cpuset: Option<Cpumask>,
     pub comment: Option<String>,
+    pub template: Option<LayerMatch>,
     pub matches: Vec<Vec<LayerMatch>>,
     pub kind: LayerKind,
 }
@@ -70,6 +75,7 @@ pub enum LayerPlacement {
 pub enum LayerMatch {
     CgroupPrefix(String),
     CgroupSuffix(String),
+    CgroupContains(String),
     CommPrefix(String),
     CommPrefixExclude(String),
     PcommPrefix(String),
@@ -157,6 +163,8 @@ pub enum LayerKind {
     Grouped {
         util_range: (f64, f64),
         #[serde(default)]
+        util_includes_open_cputime: bool,
+        #[serde(default)]
         cpus_range: Option<(usize, usize)>,
 
         #[serde(default)]
@@ -205,6 +213,16 @@ impl LayerKind {
                 Some(*util_range)
             }
             _ => None,
+        }
+    }
+
+    pub fn util_includes_open_cputime(&self) -> bool {
+        match self {
+            LayerKind::Grouped {
+                util_includes_open_cputime,
+                ..
+            } => *util_includes_open_cputime,
+            _ => false,
         }
     }
 }

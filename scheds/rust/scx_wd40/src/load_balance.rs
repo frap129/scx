@@ -626,7 +626,10 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
 
         // Read active_tasks and update read_idx and gen.
         const MAX_TPTRS: u64 = bpf_intf::consts_MAX_DOM_ACTIVE_TPTRS as u64;
-        let dom_ctx = unsafe { &mut *self.skel.maps.bss_data.dom_ctxs[dom.id] };
+
+        let types::topo_level(index) = types::topo_level::TOPO_LLC;
+        let ptr = self.skel.maps.bss_data.topo_nodes[index as usize][dom.id];
+        let dom_ctx = unsafe { std::mem::transmute::<u64, &mut types::dom_ctx>(ptr) };
         let active_tasks = &mut dom_ctx.active_tasks;
 
         let (mut ridx, widx) = (active_tasks.read_idx, active_tasks.write_idx);
@@ -686,10 +689,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
     where
         I: IntoIterator<Item = &'d TaskInfo>,
     {
-        match tasks_by_load.into_iter().next() {
-            Some(task) => Some(task),
-            None => None,
-        }
+        tasks_by_load.into_iter().next()
     }
 
     /// Try to find a task in @push_dom to be moved into @pull_dom. If a task is

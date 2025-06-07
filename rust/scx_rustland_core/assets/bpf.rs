@@ -3,6 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use std::io::{self, ErrorKind};
 use std::mem::MaybeUninit;
 
 use crate::bpf_intf;
@@ -22,6 +23,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 use plain::Plain;
+use procfs::process::all_processes;
 
 use libbpf_rs::OpenObject;
 use libbpf_rs::ProgramInput;
@@ -69,21 +71,19 @@ pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
 ///
 /// Finally the methods exited() and shutdown_and_report() can be used respectively to test
 /// whether the BPF component exited, and to shutdown and report the exit message.
-/// whether the BPF component exited, and to shutdown and report exit message.
 
 // Task queued for scheduling from the BPF component (see bpf_intf::queued_task_ctx).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Clone)]
 pub struct QueuedTask {
-    pub pid: i32,              // pid that uniquely identifies a task
-    pub cpu: i32,              // CPU where the task is running
-    pub flags: u64,            // task enqueue flags
-    pub exec_runtime: u64,     // Total cpu time since last sleep
-    pub sum_exec_runtime: u64, // Total cpu time
-    pub nvcsw: u64,            // Total amount of voluntary context switches
-    pub weight: u64,           // Task static priority
-    pub slice: u64,            // Time slice budget
-    pub vtime: u64,            // Current vruntime
-    cpumask_cnt: u64,          // cpumask generation counter (private)
+    pub pid: i32,             // pid that uniquely identifies a task
+    pub cpu: i32,             // CPU where the task is running
+    pub nr_cpus_allowed: u64, // Number of CPUs that the task can use
+    pub flags: u64,           // task enqueue flags
+    pub start_ts: u64,        // Timestamp since last time the task ran on a CPU
+    pub stop_ts: u64,         // Timestamp since last time the task released a CPU
+    pub exec_runtime: u64,    // Total cpu time since last sleep
+    pub weight: u64,          // Task static priority
+    pub vtime: u64,           // Current vruntime
 }
 
 // Task queued for dispatching to the BPF component (see bpf_intf::dispatched_task_ctx).
@@ -94,7 +94,6 @@ pub struct DispatchedTask {
     pub flags: u64,    // special dispatch flags
     pub slice_ns: u64, // time slice assigned to the task (0 = default)
     pub vtime: u64,    // task deadline / vruntime
-    cpumask_cnt: u64,  // cpumask generation counter (private)
 }
 
 impl DispatchedTask {
@@ -109,7 +108,6 @@ impl DispatchedTask {
             flags: task.flags,
             slice_ns: 0, // use default time slice
             vtime: 0,
-            cpumask_cnt: task.cpumask_cnt,
         }
     }
 }
@@ -142,14 +140,13 @@ impl EnqueuedMessage {
         QueuedTask {
             pid: self.inner.pid,
             cpu: self.inner.cpu,
+            nr_cpus_allowed: self.inner.nr_cpus_allowed,
             flags: self.inner.flags,
+            start_ts: self.inner.start_ts,
+            stop_ts: self.inner.stop_ts,
             exec_runtime: self.inner.exec_runtime,
-            sum_exec_runtime: self.inner.sum_exec_runtime,
-            nvcsw: self.inner.nvcsw,
             weight: self.inner.weight,
-            slice: self.inner.slice,
             vtime: self.inner.vtime,
-            cpumask_cnt: self.inner.cpumask_cnt,
         }
     }
 }
@@ -184,7 +181,8 @@ fn set_ctrlc_handler(shutdown: Arc<AtomicBool>) -> Result<(), anyhow::Error> {
         let shutdown_clone = shutdown.clone();
         ctrlc::set_handler(move || {
             shutdown_clone.store(true, Ordering::Relaxed);
-        }).expect("Error setting Ctrl-C handler");
+        })
+        .expect("Error setting Ctrl-C handler");
     });
     Ok(())
 }
@@ -245,15 +243,16 @@ impl<'cb> BpfScheduler<'cb> {
         let topo = Topology::new().unwrap();
         skel.maps.rodata_data.smt_enabled = topo.smt_enabled;
 
-        // Enable optional scheduler settings.
-        skel.struct_ops.rustland_mut().flags |=
-            *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED;
+        // Enable scheduler flags.
+        skel.struct_ops.rustland_mut().flags = *compat::SCX_OPS_ENQ_LAST
+            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
+            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
         if partial {
             skel.struct_ops.rustland_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
         skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
-
-        skel.maps.bss_data.usersched_pid = std::process::id();
+        skel.maps.rodata_data.usersched_pid = std::process::id();
+        skel.maps.rodata_data.khugepaged_pid = Self::khugepaged_pid();
         skel.maps.rodata_data.builtin_idle = builtin_idle;
         skel.maps.rodata_data.debug = debug;
 
@@ -284,19 +283,46 @@ impl<'cb> BpfScheduler<'cb> {
         ALLOCATOR.disable_mmap().expect("Failed to disable mmap");
 
         // Make sure to use the SCHED_EXT class at least for the scheduler itself.
-        match Self::use_sched_ext() {
-            0 => Ok(Self {
-                skel,
-                shutdown,
-                queued,
-                dispatched,
-                struct_ops,
-            }),
-            err => Err(anyhow::Error::msg(format!(
-                "sched_setscheduler error: {}",
-                err
-            ))),
+        if partial {
+            let err = Self::use_sched_ext();
+            if err < 0 {
+                return Err(anyhow::Error::msg(format!(
+                    "sched_setscheduler error: {}",
+                    err
+                )));
+            }
         }
+
+        Ok(Self {
+            skel,
+            shutdown,
+            queued,
+            dispatched,
+            struct_ops,
+        })
+    }
+
+    // Return the PID of khugepaged, if present, otherwise return 0.
+    fn khugepaged_pid() -> u32 {
+        let procs = match all_processes() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+
+        for proc in procs {
+            let proc = match proc {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if let Ok(stat) = proc.stat() {
+                if proc.exe().is_err() && stat.comm == "khugepaged" {
+                    return proc.pid() as u32;
+                }
+            }
+        }
+
+        0
     }
 
     fn enable_sibling_cpu(
@@ -334,7 +360,8 @@ impl<'cb> BpfScheduler<'cb> {
         cache_lvl: usize,
         enable_sibling_cpu_fn: &SiblingCpuFn,
     ) -> Result<(), std::io::Error>
-        where SiblingCpuFn: Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>
+    where
+        SiblingCpuFn: Fn(&mut BpfSkel<'_>, usize, usize, usize) -> Result<(), u32>,
     {
         // Determine the list of CPU IDs associated to each cache node.
         let mut cache_id_map: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -356,10 +383,15 @@ impl<'cb> BpfScheduler<'cb> {
         for (_cache_id, cpus) in cache_id_map {
             for cpu in &cpus {
                 for sibling_cpu in &cpus {
-                    match enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu) {
-                        Ok(()) => {}
-                        Err(_) => {}
-                    }
+                    enable_sibling_cpu_fn(skel, cache_lvl, *cpu, *sibling_cpu).map_err(|e| {
+                        io::Error::new(
+                            ErrorKind::Other,
+                            format!(
+                                "enable_sibling_cpu_fn failed for cpu {} sibling {}: err {}",
+                                cpu, sibling_cpu, e
+                            ),
+                        )
+                    })?;
                 }
             }
         }
@@ -511,7 +543,8 @@ impl<'cb> BpfScheduler<'cb> {
             LIBBPF_STOP => {
                 // A valid task is received, convert data to a proper task struct.
                 let task = unsafe { EnqueuedMessage::from_bytes(&BUF.0).to_queued_task() };
-                self.skel.maps.bss_data.nr_queued = self.skel.maps.bss_data.nr_queued.saturating_sub(1);
+                self.skel.maps.bss_data.nr_queued =
+                    self.skel.maps.bss_data.nr_queued.saturating_sub(1);
 
                 Ok(Some(task))
             }
@@ -540,7 +573,6 @@ impl<'cb> BpfScheduler<'cb> {
             flags,
             slice_ns,
             vtime,
-            cpumask_cnt,
             ..
         } = &mut dispatched_task.as_mut();
 
@@ -549,7 +581,6 @@ impl<'cb> BpfScheduler<'cb> {
         *flags = task.flags;
         *slice_ns = task.slice_ns;
         *vtime = task.vtime;
-        *cpumask_cnt = task.cpumask_cnt;
 
         // Store the task in the user ring buffer.
         //
@@ -569,7 +600,7 @@ impl<'cb> BpfScheduler<'cb> {
 
     // Called on exit to shutdown and report exit message from the BPF part.
     pub fn shutdown_and_report(&mut self) -> Result<UserExitInfo> {
-        self.struct_ops.take();
+        let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
 }

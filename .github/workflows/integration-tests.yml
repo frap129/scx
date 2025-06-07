@@ -13,54 +13,20 @@ jobs:
     outputs:
       matrix: ${{ steps.output.outputs.matrix }}
     steps:
-      - name: Install Nix
-        if: ${{ runner.environment == 'github-hosted' }}
-        uses: DeterminateSystems/nix-installer-action@main
-
       - uses: actions/checkout@v4
 
-      - name: Load dependencies
-        run: nix run ./.github/include#nix-develop-gha -- ./.github/include#list-tests
+      - name: Install Nix
+        uses: ./.github/actions/install-nix
+        with:
+          cachix-auth-token: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
       - name: List tests
         id: output
-        run: |
-          python3 - <<EOF
-          import itertools
-          import json
-          import os
-
-          kernel = "${{ inputs.repo-name }}"
-
-          matrix = [{ "name": x, "flags": "" } for x in [
-            "scx_bpfland",
-            "scx_chaos",
-            "scx_lavd",
-            "scx_rlfifo",
-            "scx_rusty",
-            "scx_p2dq",
-            "scx_tickless",
-          ]]
-
-          # disable rustland on stable/ kernels, see https://github.com/sched-ext/scx/issues/1794 for more info
-          if not kernel.startswith("stable/"):
-            matrix.append({ "name": "scx_rustland", "flags": "" })
-
-          for flags in itertools.product(
-              ["--disable-topology=false", "--disable-topology=true"],
-              ["", "--disable-antistall"]
-          ):
-            matrix.append({ "name": "scx_layered", "flags": " ".join(flags) })
-
-          output = f"matrix={json.dumps(matrix)}"
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            print(output, file=f)
-
-          EOF
+        run: nix run ./.github/include#list-integration-tests -- "${{ inputs.repo-name }}" >> $GITHUB_OUTPUT
 
   integration-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     needs: list-tests
     strategy:
           matrix:
@@ -69,9 +35,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/restore-kernel-cache
+      - name: Install Nix
+        uses: ./.github/actions/install-nix
         with:
-          repo-name: ${{ inputs.repo-name }}
+          cachix-auth-token: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Load kernel
+        run: |
+          echo "KERNEL_STORE_PATH=$(nix build --no-link --print-out-paths ./.github/include#'kernel_${{ inputs.repo-name }}')" >> $GITHUB_ENV
+          echo "KERNEL_HEADERS_STORE_PATH=$(nix build --no-link --print-out-paths ./.github/include#'kernel_${{ inputs.repo-name }}'.headers)" >> $GITHUB_ENV
+
+      - name: Install Veristat
+        run: nix-env -i $(nix build --no-link --print-out-paths ./.github/include#veristat)
 
       # prevent cache permission errors
       - run: sudo chown root /usr/bin/tar && sudo chmod u+s /usr/bin/tar
@@ -92,13 +67,8 @@ jobs:
       - if: ${{ steps.cache-virtiofsd.outputs.cache-hit != 'true' }}
         run: cargo install virtiofsd && sudo cp -a ~/.cargo/bin/virtiofsd /usr/lib/
 
-      # veristat
-      - run: wget https://github.com/libbpf/veristat/releases/download/v0.3.2/veristat-v0.3.2-amd64.tar.gz
-      - run: tar -xvf veristat-v0.3.2-amd64.tar.gz && sudo cp veristat /usr/bin/
-      - run: sudo chmod +x /usr/bin/veristat && sudo chmod 755 /usr/bin/veristat
-
       # The actual build:
-      - run: meson setup build -Dkernel=../linux/arch/x86/boot/bzImage -Dkernel_headers=../linux -Denable_stress=true -Dvng_rw_mount=true -Dextra_sched_args=" ${{ matrix.scheduler['flags'] }}"
+      - run: meson setup build -Dkernel=$KERNEL_STORE_PATH/bzImage -Dkernel_headers=$KERNEL_HEADERS_STORE_PATH -Denable_stress=true -Dvng_rw_mount=true -Dextra_sched_args=" ${{ matrix.scheduler['flags'] }}"
       - run: meson compile -C build ${{ matrix.scheduler['name'] }}
 
       # Print CPU model before running the tests (this can be useful for

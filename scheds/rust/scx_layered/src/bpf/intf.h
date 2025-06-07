@@ -33,7 +33,8 @@ enum consts {
 	MAX_LLCS		= 64,
 	MAX_COMM		= 16,
 	MAX_LAYER_MATCH_ORS	= 32,
-	MAX_LAYER_NAME		= 64,
+	/* 64 chars for user-provided name, 64 for possible template suffix. */
+	MAX_LAYER_NAME		= 128,
 	MAX_LAYERS		= 16,
 	MAX_LAYER_WEIGHT	= 10000,
 	MIN_LAYER_WEIGHT	= 1,
@@ -102,6 +103,8 @@ enum global_stat_id {
 	GSTAT_LO_FB_USAGE,
 	GSTAT_FB_CPU_USAGE,
 	GSTAT_ANTISTALL,
+	GSTAT_SKIP_PREEMPT,
+	GSTAT_FIXUP_VTIME,
 	NR_GSTATS,
 };
 
@@ -158,9 +161,9 @@ struct cpu_prox_map {
 struct cpu_ctx {
 	s32			cpu;
 	bool			current_preempt;
-	bool			current_exclusive;
-	bool			prev_exclusive;
-	bool			maybe_idle;
+	bool			current_excl;
+	bool			prev_excl;
+	bool			next_excl;
 	bool			yielding;
 	bool			try_preempt_first;
 	bool			is_big;
@@ -251,6 +254,7 @@ enum layer_match_kind {
 	MATCH_USED_GPU_PID,
 	MATCH_AVG_RUNTIME,
 	MATCH_CGROUP_SUFFIX,
+	MATCH_CGROUP_CONTAINS,
 
 	NR_LAYER_MATCH_KINDS,
 };
@@ -259,6 +263,7 @@ struct layer_match {
 	int		kind;
 	char		cgroup_prefix[MAX_PATH];
 	char		cgroup_suffix[MAX_PATH];
+	char		cgroup_substr[MAX_PATH];
 	char		comm_prefix[MAX_COMM];
 	char		pcomm_prefix[MAX_COMM];
 	int		nice;
@@ -324,7 +329,7 @@ struct layer {
 	int			kind;
 	bool			preempt;
 	bool			preempt_first;
-	bool			exclusive;
+	bool			excl;
 	bool			allow_node_aligned;
 	bool			skip_remote_node;
 	bool			prev_over_idle_core;
@@ -350,6 +355,7 @@ struct layer {
 	char			name[MAX_LAYER_NAME];
 	bool			is_protected;
 	bool			periodically_refresh;
+	u8			cpuset[MAX_CPUS_U8];
 };
 
 struct scx_cmd {
