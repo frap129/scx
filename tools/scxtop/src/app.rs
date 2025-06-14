@@ -19,6 +19,7 @@ use crate::LlcData;
 use crate::NodeData;
 use crate::PerfEvent;
 use crate::PerfettoTraceManager;
+use crate::Search;
 use crate::VecStats;
 use crate::ViewState;
 use crate::APP;
@@ -89,15 +90,16 @@ pub struct App<'a> {
     collect_cpu_freq: bool,
     collect_uncore_freq: bool,
     pstate: bool,
-    event_scroll_state: ScrollbarState,
     event_scroll: u16,
 
     active_event: PerfEvent,
     active_hw_event_id: usize,
     active_perf_events: BTreeMap<usize, PerfEvent>,
     available_events: Vec<PerfEvent>,
+    event_input_buffer: String,
+    event_search: Search,
 
-    available_perf_events_list: Vec<String>,
+    filtered_perf_events_list: Vec<String>,
     cpu_data: BTreeMap<usize, CpuData>,
     llc_data: BTreeMap<usize, LlcData>,
     node_data: BTreeMap<usize, NodeData>,
@@ -186,7 +188,7 @@ impl<'a> App<'a> {
             node_data.insert(node.id, data);
         }
 
-        let available_perf_events_list: Vec<String> = available_perf_events()?
+        let initial_perf_events_list: Vec<String> = available_perf_events()?
             .iter()
             .flat_map(|(subsystem, events)| {
                 events
@@ -194,7 +196,7 @@ impl<'a> App<'a> {
                     .map(|event| format!("{}:{}", subsystem.clone(), event.clone()))
             })
             .collect();
-        let num_perf_events: u16 = available_perf_events_list.len() as u16;
+        let num_perf_events: u16 = initial_perf_events_list.len() as u16;
         let mut stats_client = StatsClient::new();
         let stats_socket_path = config.stats_socket_path();
         if !stats_socket_path.is_empty() {
@@ -241,13 +243,14 @@ impl<'a> App<'a> {
             llc_data,
             node_data,
             dsq_data: BTreeMap::new(),
-            event_scroll_state: ScrollbarState::new(num_perf_events.into()).position(0),
             event_scroll: 0,
             active_hw_event_id: 0,
             active_event,
             active_perf_events,
             available_events: default_events,
-            available_perf_events_list,
+            event_input_buffer: String::new(),
+            event_search: Search::new(initial_perf_events_list.clone()),
+            filtered_perf_events_list: Vec::new(),
             num_perf_events,
             events_list_size: 1,
             selected_event: 0,
@@ -274,7 +277,9 @@ impl<'a> App<'a> {
 
     /// Sets the state of the application.
     pub fn set_state(&mut self, state: AppState) {
-        self.prev_state = self.state.clone();
+        if self.state != AppState::Help && self.state != AppState::Event {
+            self.prev_state = self.state.clone();
+        }
         self.state = state;
         if self.prev_state == AppState::MangoApp {
             self.process_id = self.prev_process_id;
@@ -899,7 +904,7 @@ impl<'a> App<'a> {
         }
 
         self.render_scheduler("dsq_lat_us", frame, top_left, true, true)?;
-        self.render_dsq_vtime(frame, bottom_left, true, false)?;
+        self.render_scheduler("dsq_slice_consumed", frame, bottom_left, true, false)?;
 
         Ok(())
     }
@@ -1025,7 +1030,7 @@ impl<'a> App<'a> {
         }
 
         self.render_scheduler("dsq_lat_us", frame, top_left, true, true)?;
-        self.render_dsq_vtime(frame, bottom_left, true, false)?;
+        self.render_scheduler("dsq_slice_consumed", frame, bottom_left, true, false)?;
         Ok(())
     }
 
@@ -1276,136 +1281,6 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    /// Returns the dsq vtime chart.
-    fn render_dsq_vtime_sparklines(
-        &self,
-        event: &str,
-        frame: &mut Frame,
-        area: Rect,
-        render_title: bool,
-        render_sample_rate: bool,
-    ) -> Result<()> {
-        let num_dsqs = self
-            .dsq_data
-            .iter()
-            .filter(|(_dsq_id, dsq_data)| dsq_data.data.contains_key(event))
-            .count();
-        if num_dsqs == 0 {
-            let block = Block::default()
-                .title_top(
-                    Line::from(self.scheduler.clone())
-                        .style(self.theme().title_style())
-                        .centered(),
-                )
-                .style(self.theme().border_style())
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded);
-            frame.render_widget(block, area);
-            return Ok(());
-        }
-        let mut dsq_constraints = vec![];
-
-        for _ in 0..num_dsqs {
-            dsq_constraints.push(Constraint::Ratio(1, num_dsqs as u32));
-        }
-        let dsqs_verticle = Layout::vertical(dsq_constraints).split(area);
-
-        self.dsq_sparklines(event, render_title, render_sample_rate)
-            .iter()
-            .enumerate()
-            .for_each(|(j, dsq_sparkline)| {
-                frame.render_widget(dsq_sparkline, dsqs_verticle[j]);
-            });
-
-        Ok(())
-    }
-
-    /// Returns the dsq vtime chart.
-    fn render_dsq_vtime_barchart(
-        &self,
-        event: &str,
-        frame: &mut Frame,
-        area: Rect,
-        render_sample_rate: bool,
-    ) -> Result<()> {
-        let num_dsqs = self
-            .dsq_data
-            .iter()
-            .filter(|(_dsq_id, dsq_data)| dsq_data.data.contains_key(event))
-            .count();
-        if num_dsqs == 0 {
-            let block = Block::default()
-                .title_top(
-                    Line::from(self.scheduler.clone())
-                        .style(self.theme().title_style())
-                        .centered(),
-                )
-                .style(self.theme().border_style())
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded);
-            frame.render_widget(block, area);
-            return Ok(());
-        }
-
-        let dsq_constraints = vec![Constraint::Percentage(1), Constraint::Percentage(99)];
-        let dsqs_verticle = Layout::vertical(dsq_constraints).split(area);
-        let sample_rate = self.skel.maps.data_data.sample_rate;
-
-        let vtime_global_iter: Vec<u64> = self
-            .dsq_data
-            .iter()
-            .filter(|(_dsq_id, event_data)| event_data.data.contains_key(event))
-            .flat_map(|(_dsq_id, event_data)| event_data.event_data_immut(event))
-            .collect::<Vec<u64>>();
-
-        let stats = VecStats::new(&vtime_global_iter, true, true, true, None);
-
-        let bar_block = Block::default()
-            .title_top(
-                Line::from(if self.localize {
-                    format!(
-                        "{} {} avg {} max {} min {}",
-                        self.scheduler,
-                        event,
-                        stats.avg.to_formatted_string(&self.locale),
-                        stats.max.to_formatted_string(&self.locale),
-                        stats.min.to_formatted_string(&self.locale),
-                    )
-                } else {
-                    format!(
-                        "{} {} avg {} max {} min {}",
-                        self.scheduler, event, stats.avg, stats.max, stats.min,
-                    )
-                })
-                .style(self.theme().title_style())
-                .centered(),
-            )
-            .title_top(if render_sample_rate {
-                Line::from(format!("sample rate {}", sample_rate))
-                    .style(self.theme().text_important_color())
-                    .right_aligned()
-            } else {
-                Line::from("")
-            })
-            .style(self.theme().border_style())
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
-
-        let dsq_bars: Vec<Bar> = self.dsq_bars(event);
-
-        let barchart = BarChart::default()
-            .data(BarGroup::default().bars(&dsq_bars))
-            .block(bar_block)
-            .max(stats.max)
-            .direction(Direction::Horizontal)
-            .bar_style(self.theme().sparkline_style())
-            .bar_gap(0)
-            .bar_width(1);
-
-        frame.render_widget(barchart, dsqs_verticle[1]);
-        Ok(())
-    }
-
     /// Renders the scheduler state as barcharts.
     fn render_scheduler_barchart(
         &mut self,
@@ -1428,8 +1303,6 @@ impl<'a> App<'a> {
             frame.render_widget(block, area);
             return Ok(());
         }
-        let dsq_constraints = vec![Constraint::Percentage(1), Constraint::Percentage(99)];
-        let dsqs_verticle = Layout::vertical(dsq_constraints).split(area);
         let sample_rate = self.skel.maps.data_data.sample_rate;
 
         let dsq_global_iter = self
@@ -1481,7 +1354,7 @@ impl<'a> App<'a> {
             .bar_gap(0)
             .bar_width(1);
 
-        frame.render_widget(barchart, dsqs_verticle[1]);
+        frame.render_widget(barchart, area);
         Ok(())
     }
 
@@ -1504,28 +1377,6 @@ impl<'a> App<'a> {
             ),
             ViewState::BarChart => {
                 self.render_scheduler_barchart(event, frame, area, render_sample_rate)
-            }
-        }
-    }
-
-    /// Renders the scheduler application state.
-    fn render_dsq_vtime(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        render_title: bool,
-        render_sample_rate: bool,
-    ) -> Result<()> {
-        match self.view_state {
-            ViewState::Sparkline => self.render_dsq_vtime_sparklines(
-                "dsq_vtime_delta",
-                frame,
-                area,
-                render_title,
-                render_sample_rate,
-            ),
-            ViewState::BarChart => {
-                self.render_dsq_vtime_barchart("dsq_vtime_delta", frame, area, render_sample_rate)
             }
         }
     }
@@ -1801,7 +1652,7 @@ impl<'a> App<'a> {
 
         self.render_event(frame, right)?;
         self.render_scheduler("dsq_lat_us", frame, top_left, true, true)?;
-        self.render_dsq_vtime(frame, bottom_left, true, false)?;
+        self.render_scheduler("dsq_slice_consumed", frame, bottom_left, true, false)?;
         Ok(())
     }
 
@@ -1977,6 +1828,15 @@ impl<'a> App<'a> {
             )),
             Line::from(Span::styled(
                 format!(
+                    "{}: display default view",
+                    self.config
+                        .active_keymap
+                        .action_keys_string(Action::SetState(AppState::Default))
+                ),
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                format!(
                     "{}: display LLC view",
                     self.config
                         .active_keymap
@@ -2022,6 +1882,15 @@ impl<'a> App<'a> {
                 ),
                 Style::default(),
             )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "For bug reporting and project updates, visit:",
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                "https://github.com/sched-ext/scx",
+                Style::default(),
+            )),
         ];
         frame.render_widget(
             Paragraph::new(text)
@@ -2042,15 +1911,30 @@ impl<'a> App<'a> {
     fn render_event_list(&mut self, frame: &mut Frame) -> Result<()> {
         let area = frame.area();
         let default_style = Style::default().fg(self.theme().text_color());
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Percentage(99)]).split(area);
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Percentage(98),
+            Constraint::Min(3),
+        ])
+        .split(area);
 
         let height = if area.height > 0 { area.height - 1 } else { 1 };
         if height != self.events_list_size {
             self.events_list_size = height
         }
 
+        self.filtered_perf_events_list = self.event_search.fuzzy_search(&self.event_input_buffer);
+        self.num_perf_events = self.filtered_perf_events_list.len() as u16;
+        if (self.num_perf_events as usize) <= self.selected_event {
+            self.selected_event = (self.num_perf_events as usize) - 1;
+        }
+
+        if self.num_perf_events <= self.event_scroll {
+            self.event_scroll = self.num_perf_events - 1;
+        }
+
         let events: Vec<Line> = self
-            .available_perf_events_list
+            .filtered_perf_events_list
             .iter()
             .enumerate()
             .map(|(i, event)| {
@@ -2067,7 +1951,7 @@ impl<'a> App<'a> {
             .title_alignment(Alignment::Center)
             .title(
                 format!(
-                    "Use ▲ ▼  ({}/{}) to scroll, {} to select",
+                    "Type to filter list, use ▲ ▼  ({}/{}) to scroll, {} to select, Esc to exit",
                     self.config.active_keymap.action_keys_string(Action::PageUp),
                     self.config
                         .active_keymap
@@ -2083,12 +1967,19 @@ impl<'a> App<'a> {
             .scroll((self.event_scroll, 0));
         frame.render_widget(paragraph, chunks[1]);
 
+        let input_box = Paragraph::new(format!("# > {}", self.event_input_buffer))
+            .style(default_style)
+            .bold()
+            .block(Block::new().borders(Borders::ALL));
+        frame.render_widget(input_box, chunks[2]);
+
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓")),
             chunks[1],
-            &mut self.event_scroll_state,
+            &mut ScrollbarState::new(self.num_perf_events.into())
+                .position(self.event_scroll as usize),
         );
 
         Ok(())
@@ -2219,7 +2110,7 @@ impl<'a> App<'a> {
 
     /// Updates app state when the down arrow or mapped key is pressed.
     fn on_down(&mut self) {
-        if self.state == AppState::Event && self.event_scroll <= self.num_perf_events {
+        if self.state == AppState::Event && self.event_scroll < self.num_perf_events - 1 {
             self.event_scroll += 1;
             self.selected_event += 1
         }
@@ -2258,9 +2149,9 @@ impl<'a> App<'a> {
 
     /// Updates app state when the enter key is pressed.
     fn on_enter(&mut self) {
-        if self.state == AppState::Event {
+        if self.state == AppState::Event && !self.filtered_perf_events_list.is_empty() {
             if let Some((subsystem, event)) =
-                self.available_perf_events_list[self.selected_event].split_once(":")
+                self.filtered_perf_events_list[self.selected_event].split_once(":")
             {
                 let perf_event = PerfEvent::new(subsystem.to_string(), event.to_string(), 0);
                 self.active_perf_events.clear();
@@ -2483,7 +2374,10 @@ impl<'a> App<'a> {
             self.max_cpu_events,
         ));
 
-        if *next_dsq_id != scx_enums.SCX_DSQ_INVALID && *next_dsq_lat_us > 0 {
+        let next_dsq_id = Self::classify_dsq(*next_dsq_id);
+        let prev_dsq_id = Self::classify_dsq(*prev_dsq_id);
+
+        if next_dsq_id != scx_enums.SCX_DSQ_INVALID && *next_dsq_lat_us > 0 {
             if self.state == AppState::MangoApp {
                 if self.process_id > 0 && action.next_tgid == self.process_id as u32 {
                     cpu_data.add_event_data("dsq_lat_us", *next_dsq_lat_us);
@@ -2494,7 +2388,7 @@ impl<'a> App<'a> {
 
             let next_dsq_data = self
                 .dsq_data
-                .entry(*next_dsq_id)
+                .entry(next_dsq_id)
                 .or_insert(EventData::new(self.max_cpu_events));
 
             if self.state == AppState::MangoApp {
@@ -2521,10 +2415,10 @@ impl<'a> App<'a> {
             }
         }
 
-        if *prev_dsq_id != scx_enums.SCX_DSQ_INVALID && *prev_used_slice_ns > 0 {
+        if prev_dsq_id != scx_enums.SCX_DSQ_INVALID && *prev_used_slice_ns > 0 {
             let prev_dsq_data = self
                 .dsq_data
-                .entry(*prev_dsq_id)
+                .entry(prev_dsq_id)
                 .or_insert(EventData::new(self.max_cpu_events));
             if self.state == AppState::MangoApp {
                 if self.process_id > 0 && action.prev_tgid == self.process_id as u32 {
@@ -2533,6 +2427,18 @@ impl<'a> App<'a> {
             } else {
                 prev_dsq_data.add_event_data("dsq_slice_consumed", *prev_used_slice_ns);
             }
+        }
+    }
+
+    // Groups built-in dsq's (GLOBAL, LOCAL, and LOCAL-ON)
+    fn classify_dsq(dsq_id: u64) -> u64 {
+        if dsq_id & scx_enums.SCX_DSQ_FLAG_BUILTIN == 0 {
+            dsq_id
+        } else if (dsq_id & scx_enums.SCX_DSQ_LOCAL_ON) == scx_enums.SCX_DSQ_LOCAL_ON {
+            scx_enums.SCX_DSQ_LOCAL_ON
+        } else {
+            // Catches both GLOBAL and LOCAL bits (1 or 2)
+            dsq_id & (scx_enums.SCX_DSQ_FLAG_BUILTIN | 3)
         }
     }
 
@@ -2727,6 +2633,21 @@ impl<'a> App<'a> {
                 _ => {
                     self.should_quit.store(true, Ordering::Relaxed);
                 }
+            },
+            Action::InputEntry(input) => {
+                self.event_input_buffer.push_str(input);
+            }
+            Action::Backspace => {
+                self.event_input_buffer.pop();
+                self.selected_event = 0;
+                self.event_scroll = 0;
+            }
+            Action::Esc => match self.state() {
+                AppState::Event => {
+                    self.event_input_buffer.clear();
+                    self.handle_action(&Action::SetState(self.prev_state.clone()))?;
+                }
+                _ => self.handle_action(&Action::Quit)?,
             },
             _ => {}
         };

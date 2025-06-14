@@ -39,21 +39,17 @@
  * load balance based on userspace's setting of the target_dom field.
  */
 
-#ifdef LSP
-#define __bpf__
-#include "../../../../include/scx/common.bpf.h"
-#include "../../../../include/scx/ravg_impl.bpf.h"
-#else
 #include <scx/common.bpf.h>
-#include <scx/ravg_impl.bpf.h>
-#include <lib/sdt_task.h>
-#endif
 
 #include <scx/bpf_arena_common.h>
 #include <scx/bpf_arena_spin_lock.h>
+#include <scx/ravg_impl.bpf.h>
 
+#include <lib/arena.h>
 #include <lib/cpumask.h>
 #include <lib/percpu.h>
+#include <lib/topology.h>
+#include <lib/sdt_task.h>
 
 #include "intf.h"
 #include "types.h"
@@ -79,8 +75,6 @@ UEI_DEFINE(uei);
 /*
  * Domains and cpus
  */
-const volatile u32 nr_cpu_ids = 64;	/* !0 for veristat, set during init */
-const volatile u32 cpu_dom_id_map[MAX_CPUS];
 const volatile u32 wd40_perf_mode;
 
 const volatile bool kthreads_local;
@@ -90,49 +84,6 @@ const volatile u32 greedy_threshold;
 const volatile u32 greedy_threshold_x_numa;
 
 struct pcpu_ctx pcpu_ctx[MAX_CPUS];
-
-static s32 scx_bitmap_pick_idle_cpu(scx_bitmap_t mask __arg_arena, int flags)
-{
-	struct bpf_cpumask __kptr *bpf = scx_percpu_bpfmask();
-	s32 cpu;
-
-	if (!bpf)
-		return -1;
-
-	scx_bitmap_to_bpf(bpf, mask);
-	cpu = scx_bpf_pick_idle_cpu(cast_mask(bpf), flags);
-
-	scx_bitmap_from_bpf(mask, cast_mask(bpf));
-
-	return cpu;
-}
-
-static s32 scx_bitmap_any_distribute(scx_bitmap_t mask __arg_arena)
-{
-	struct bpf_cpumask __kptr *bpf = scx_percpu_bpfmask();
-	s32 cpu;
-
-	if (!bpf)
-		return -1;
-	scx_bitmap_to_bpf(bpf, mask);
-	cpu = bpf_cpumask_any_distribute(cast_mask(bpf));
-
-	return cpu;
-}
-
-static s32 scx_bitmap_any_and_distribute(scx_bitmap_t scx, const struct cpumask *bpf)
-{
-	struct bpf_cpumask *tmp = scx_percpu_bpfmask();
-	s32 cpu;
-
-	if (!bpf || !tmp)
-		return -1;
-
-	scx_bitmap_to_bpf(tmp, scx);
-	cpu = bpf_cpumask_any_and_distribute(cast_mask(tmp), bpf);
-
-	return cpu;
-}
 
 static struct pcpu_ctx *lookup_pcpu_ctx(s32 cpu)
 {
@@ -161,20 +112,33 @@ scx_bitmap_t all_cpumask;
 scx_bitmap_t direct_greedy_cpumask;
 scx_bitmap_t kick_greedy_cpumask;
 
-static u32 cpu_to_dom_id(s32 cpu)
+static inline u32 cpu_to_dom_id(u32 cpu)
 {
-	const volatile u32 *dom_idp;
+	topo_ptr topo;
+	u32 id;
 
-	dom_idp = MEMBER_VPTR(cpu_dom_id_map, [cpu]);
-	if (!dom_idp)
+	if (cpu >= NR_CPUS) {
+		scx_bpf_error("invalid CPU ID");
 		return MAX_DOMS;
+	}
 
-	return *dom_idp;
+	topo = (topo_ptr)topo_nodes[TOPO_CPU][cpu];
+	if (!topo) {
+		scx_bpf_error("cpu is offline");
+		return MAX_DOMS;
+	}
+
+	id = topo->parent->parent->id;
+	if (id >= MAX_DOMS) {
+		scx_bpf_error("invalid domain id");
+	}
+
+	return id;
 }
 
 static inline bool is_offline_cpu(s32 cpu)
 {
-	return cpu_to_dom_id(cpu) > MAX_DOMS;
+	return topo_nodes[TOPO_CPU] == NULL;
 }
 
 static s32 try_sync_wakeup(struct task_struct *p, task_ptr taskc,
@@ -612,6 +576,8 @@ void BPF_STRUCT_OPS(wd40_dispatch, s32 cpu, struct task_struct *prev)
 	u32 curr_dom = cpu_to_dom_id(cpu);
 	struct pcpu_ctx *pcpuc;
 
+	scx_arena_subprog_init();
+
 	/*
 	 * In older kernels, we may receive an ops.dispatch() callback when a
 	 * CPU is coming online during a hotplug _before_ the hotplug callback
@@ -853,22 +819,9 @@ static s32 initialize_cpu(s32 cpu)
 }
 
 SEC("syscall")
-int wd40_arena_setup(void)
+int wd40_setup(void)
 {
 	int ret, i;
-
-	ret = scx_static_init(STATIC_ALLOC_PAGES_GRANULARITY);
-	if (ret)
-		return ret;
-
-	/* How many types to store all CPU IDs? */
-	ret = scx_bitmap_init(div_round_up(nr_cpu_ids, 8));
-	if (ret)
-		return ret;
-
-	ret = scx_percpu_storage_init();
-	if (ret)
-		return ret;
 
 	ret = create_save_scx_bitmap(&all_cpumask);
 	if (ret)
@@ -883,10 +836,6 @@ int wd40_arena_setup(void)
 		return ret;
 
 	ret = lb_domain_init();
-	if (ret)
-		return ret;
-
-	ret = scx_task_init(sizeof(struct task_ctx));
 	if (ret)
 		return ret;
 
@@ -909,6 +858,11 @@ int wd40_arena_setup(void)
 			return ret;
 	}
 
+	if (debug) {
+		topo_print();
+		topo_print_by_level();
+	}
+
 	return 0;
 }
 
@@ -921,8 +875,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(wd40_init)
 		if (ret)
 			return ret;
 
-		scx_bitmap_or(all_cpumask, all_cpumask, dom_ctxs[i]->cpumask);
 	}
+
+	scx_bitmap_or(all_cpumask, all_cpumask, topo_all->mask);
 
 	bpf_for(i, 0, nr_cpu_ids) {
 

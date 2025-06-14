@@ -2,33 +2,33 @@
   "sched_ext/for-next": {
     "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git",
     "branch": "for-next",
-    "commitHash": "771641d7c9a7a06e36281597646a99c5c67fe7fa",
-    "lastModified": 1746071732,
-    "narHash": "sha256-eGh/LPhyxWpcloCJSxs7gLWk2XY5wQJ0amz3Gz0P/9o=",
-    "kernelVersion": "6.14.0"
+    "commitHash": "7a972c4dc5288087cbb5a66d4cd6d5e6ced4b6c0",
+    "lastModified": 1749873161,
+    "narHash": "sha256-rUNiRSHKtMiv8AWw3ua072Bj3fSjepUtVzjWlPEk8Zk=",
+    "kernelVersion": "6.16.0-rc1"
   },
   "bpf/bpf-next": {
     "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git",
     "branch": "master",
-    "commitHash": "62e23f183839c3d718ab36ce1c0cf7cb4b9c05a4",
-    "lastModified": 1746503352,
-    "narHash": "sha256-ArdZdcxRC2J55Nn9AHtJmXta2CuIreU767jsemPnvYg=",
-    "kernelVersion": "6.15.0-rc4"
+    "commitHash": "f66b4aaff2548bed5eedded0f47ae3a9ac933cec",
+    "lastModified": 1749873158,
+    "narHash": "sha256-VCzB8nzlRVrJMEh7/lgDAD4fp9OhCsrAB/hCqJwWKQo=",
+    "kernelVersion": "6.15.0"
   },
   "stable/6_12": {
     "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
     "branch": "linux-6.12.y",
-    "commitHash": "b801eaa96a5a2f2a8fe0b5982ffe4a1fba3c1e93",
-    "lastModified": 1746503353,
-    "narHash": "sha256-pT7aJpvvy5S0nj6HRZSalrKs34BQGi5aLqT2AY8MXxY=",
-    "kernelVersion": "6.12.27"
+    "commitHash": "e03ced99c437f4a7992b8fa3d97d598f55453fd0",
+    "lastModified": 1749614323,
+    "narHash": "sha256-9TLCE0q7A25F1UIpFB6oHNWJpYiGaFTQ1sYbmT0depY=",
+    "kernelVersion": "6.12.33"
   },
   "stable/linux-rolling-stable": {
     "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
     "branch": "linux-rolling-stable",
-    "commitHash": "d2cb798d2d8ceb0d194721a2cb0e577b4b927573",
-    "lastModified": 1746243995,
-    "narHash": "sha256-9FVjWxVurrsPqT3hSRHnga3T6Aj3MMCqtpC2+rPfm6U=",
-    "kernelVersion": "6.14.5"
+    "commitHash": "b0d369dbad20a8c9702607e7294d63c4a0c8e0fe",
+    "lastModified": 1749614376,
+    "narHash": "sha256-9kmPz/+vDXYsdwDK2IAEBPO7KkfSYAZp4uP7gXwU/8U=",
+    "kernelVersion": "6.15.2"
   }
 }

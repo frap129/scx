@@ -2,6 +2,11 @@
 
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
+pub mod bpf_intf;
+
+mod bpf_skel;
+pub use bpf_skel::*;
+
 pub use scx_utils::CoreType;
 use scx_utils::Topology;
 pub use scx_utils::NR_CPU_IDS;
@@ -36,9 +41,13 @@ pub struct SchedulerOpts {
     #[clap(short = 'r', long, default_value = "10")]
     pub interactive_ratio: usize,
 
-    /// Disables eager pick2 load balancing.
-    #[clap(short = 'e', long, action = clap::ArgAction::SetTrue)]
+    /// *DEPRECATED* Disables eager pick2 load balancing.
+    #[clap(short = 'e', long, help="DEPRECATED", action = clap::ArgAction::SetTrue)]
     pub eager_load_balance: bool,
+
+    /// Enables CPU frequency control.
+    #[clap(short = 'f', long, action = clap::ArgAction::SetTrue)]
+    pub freq_control: bool,
 
     /// ***DEPRECATED*** Disables greedy idle CPU selection, may cause better load balancing on
     /// multi-LLC systems.
@@ -48,6 +57,10 @@ pub struct SchedulerOpts {
     /// Interactive tasks stay sticky to their CPU if no idle CPU is found.
     #[clap(short = 'y', long, action = clap::ArgAction::SetTrue)]
     pub interactive_sticky: bool,
+
+    /// Interactive tasks are FIFO scheduled
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub interactive_fifo: bool,
 
     /// Disables pick2 load balancing on the dispatch path.
     #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
@@ -66,13 +79,17 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub keep_running: bool,
 
-    /// Minimum load for load balancing on the wakeup path, 0 to disable.
-    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u64).range(0..99))]
+    /// *DEPRECATED* Minimum load for load balancing on the wakeup path, 0 to disable.
+    #[clap(long, default_value = "0", help="DEPRECATED", value_parser = clap::value_parser!(u64).range(0..99))]
     pub wakeup_lb_busy: u64,
 
     /// Allow LLC migrations on the wakeup path.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub wakeup_llc_migrations: bool,
+
+    /// Allow selecting idle in enqueue path.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub select_idle_in_enqueue: bool,
 
     /// Set idle QoS resume latency based in microseconds.
     #[clap(long)]
@@ -184,6 +201,7 @@ macro_rules! init_open_skel {
             $skel.maps.rodata_data.kthreads_local = !opts.disable_kthreads_local;
             $skel.maps.rodata_data.nr_cpus = *$crate::NR_CPU_IDS as u32;
             $skel.maps.rodata_data.nr_dsqs_per_llc = opts.dumb_queues as u32;
+            $skel.maps.rodata_data.nr_cpu_ids = *NR_CPU_IDS as u32;
             $skel.maps.rodata_data.init_dsq_index = opts.init_dsq_index as i32;
             $skel.maps.rodata_data.nr_llcs = $crate::TOPO.all_llcs.clone().keys().len() as u32;
             $skel.maps.rodata_data.nr_nodes = $crate::TOPO.nodes.clone().keys().len() as u32;
@@ -195,12 +213,14 @@ macro_rules! init_open_skel {
             $skel.maps.rodata_data.dispatch_lb_busy = opts.dispatch_lb_busy;
             $skel.maps.rodata_data.dispatch_lb_interactive = opts.dispatch_lb_interactive;
             $skel.maps.rodata_data.eager_load_balance = !opts.eager_load_balance;
+            $skel.maps.rodata_data.freq_control = opts.freq_control;
             $skel.maps.rodata_data.has_little_cores = $crate::TOPO.has_little_cores();
             $skel.maps.rodata_data.interactive_sticky = opts.interactive_sticky;
+            $skel.maps.rodata_data.interactive_fifo = opts.interactive_fifo;
             $skel.maps.rodata_data.keep_running_enabled = opts.keep_running;
             $skel.maps.rodata_data.max_dsq_pick2 = opts.max_dsq_pick2;
             $skel.maps.rodata_data.smt_enabled = $crate::TOPO.smt_enabled;
-            $skel.maps.rodata_data.select_idle_in_enqueue = true;
+            $skel.maps.rodata_data.select_idle_in_enqueue = opts.select_idle_in_enqueue;
             $skel.maps.rodata_data.wakeup_lb_busy = opts.wakeup_lb_busy;
             $skel.maps.rodata_data.wakeup_llc_migrations = opts.wakeup_llc_migrations;
             $skel.maps.rodata_data.max_exec_ns =
@@ -223,6 +243,9 @@ macro_rules! init_skel {
                 };
             $skel.maps.bss_data.cpu_llc_ids[cpu.id] = cpu.llc_id as u64;
             $skel.maps.bss_data.cpu_node_ids[cpu.id] = cpu.node_id as u64;
+        }
+        for llc in $crate::TOPO.all_llcs.values() {
+            $skel.maps.bss_data.llc_ids[llc.id] = llc.id as u64;
         }
     };
 }

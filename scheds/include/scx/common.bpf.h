@@ -29,9 +29,15 @@
 
 #define PF_IO_WORKER			0x00000010	/* Task is an IO worker */
 #define PF_WQ_WORKER			0x00000020	/* I'm a workqueue worker */
+#define PF_KCOMPACTD			0x00010000      /* I am kcompactd */
+#define PF_KSWAPD			0x00020000      /* I am kswapd */
 #define PF_KTHREAD			0x00200000	/* I am a kernel thread */
 #define PF_EXITING			0x00000004
 #define CLOCK_MONOTONIC			1
+
+#ifndef NR_CPUS
+#define NR_CPUS 1024
+#endif
 
 #ifndef NUMA_NO_NODE
 #define	NUMA_NO_NODE	(-1)
@@ -505,7 +511,7 @@ static inline s64 time_delta(u64 after, u64 before)
  */
 static inline bool time_after(u64 a, u64 b)
 {
-	 return (s64)(b - a) < 0;
+	return (s64)(b - a) < 0;
 }
 
 /**
@@ -529,7 +535,7 @@ static inline bool time_before(u64 a, u64 b)
  */
 static inline bool time_after_eq(u64 a, u64 b)
 {
-	 return (s64)(a - b) >= 0;
+	return (s64)(a - b) >= 0;
 }
 
 /**
@@ -576,9 +582,15 @@ static inline bool time_in_range_open(u64 a, u64 b, u64 c)
  */
 
 /* useful compiler attributes */
+#ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+#ifndef __maybe_unused
 #define __maybe_unused __attribute__((__unused__))
+#endif
 
 /*
  * READ/WRITE_ONCE() are from kernel (include/asm-generic/rwonce.h). They

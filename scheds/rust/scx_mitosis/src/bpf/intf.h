@@ -19,6 +19,7 @@ typedef _Bool bool;
 #endif
 
 enum consts {
+	CACHELINE_SIZE = 64,
 	MAX_CPUS_SHIFT = 9,
 	MAX_CPUS = 1 << MAX_CPUS_SHIFT,
 	MAX_CPUS_U8 = MAX_CPUS / 8,
@@ -33,6 +34,9 @@ enum consts {
 enum cell_stat_idx {
 	CSTAT_LOCAL,
 	CSTAT_GLOBAL,
+	CSTAT_LO_FALLBACK_Q,
+	CSTAT_HI_FALLBACK_Q,
+	CSTAT_DEFAULT_Q,
 	CSTAT_AFFN_VIOL,
 	NR_CSTATS,
 };
@@ -45,11 +49,20 @@ struct cpu_ctx {
 };
 
 struct cgrp_ctx {
-	struct ravg_data load_rd;
-	u64 load;
-	struct ravg_data pinned_load_rd;
-	u64 pinned_load;
 	u32 cell;
+	bool cell_owner;
+};
+
+/*
+ * cell is the per-cell book-keeping
+*/
+struct cell {
+	// current vtime of the cell
+	u64 vtime_now;
+	// which dsq the cell uses
+	u32 dsq;
+	// Whether or not the cell is used or not
+	u32 in_use;
 };
 
 #endif /* __INTF_H */
