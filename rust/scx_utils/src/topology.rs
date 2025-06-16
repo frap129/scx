@@ -77,6 +77,7 @@ use crate::Cpumask;
 use anyhow::bail;
 use anyhow::Result;
 use glob::glob;
+use log::warn;
 use sscanf::sscanf;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -426,9 +427,7 @@ fn create_insert_cpu(
     node: &mut Node,
     online_mask: &Cpumask,
     topo_ctx: &mut TopoCtx,
-    big_little: bool,
-    avg_cpu_freq: Option<(usize, usize)>,
-    capacity_src: Option<(String, usize, usize)>,
+    cs: &CapacitySource,
     flatten_llc: bool,
 ) -> Result<()> {
     // CPU is offline. The Topology hierarchy is read-only, and assumes
@@ -476,10 +475,9 @@ fn create_insert_cpu(
         read_from_file(&freq_path.join("cpuinfo_transition_latency")).unwrap_or(0_usize);
 
     // Cpu capacity
-    let (cap_suffix, _avg_rcap, max_rcap) = capacity_src.unwrap_or(("".to_string(), 1024, 1024));
-    let cap_path = cpu_path.join(cap_suffix);
-    let rcap = read_from_file(&cap_path).unwrap_or(max_rcap);
-    let cpu_capacity = (rcap * 1024) / max_rcap;
+    let cap_path = cpu_path.join(cs.suffix.clone());
+    let rcap = read_from_file(&cap_path).unwrap_or(cs.max_rcap);
+    let cpu_capacity = (rcap * 1024) / cs.max_rcap;
 
     // Power management
     let power_path = cpu_path.join("power");
@@ -503,21 +501,12 @@ fn create_insert_cpu(
     }));
     let llc_mut = Arc::get_mut(llc).unwrap();
 
-    let core_type = if !big_little {
+    let core_type = if cs.avg_rcap < cs.max_rcap && rcap == cs.max_rcap {
+        CoreType::Big { turbo: true }
+    } else if !cs.has_biglittle || rcap >= cs.avg_rcap {
         CoreType::Big { turbo: false }
     } else {
-        match avg_cpu_freq {
-            Some((avg_base_freq, top_max_freq)) => {
-                if max_freq == top_max_freq {
-                    CoreType::Big { turbo: true }
-                } else if base_freq >= avg_base_freq {
-                    CoreType::Big { turbo: false }
-                } else {
-                    CoreType::Little
-                }
-            }
-            None => CoreType::Big { turbo: false },
-        }
+        CoreType::Little
     };
 
     let num_cores = topo_ctx.node_core_kernel_ids.len();
@@ -591,7 +580,18 @@ fn read_cpu_ids() -> Result<Vec<usize>> {
     Ok(cpu_ids)
 }
 
-fn cpu_capacity_source() -> Option<(String, usize, usize)> {
+struct CapacitySource {
+    /// Path suffix after /sys/devices/system/cpu/cpuX
+    suffix: String,
+    /// Average raw capacity value
+    avg_rcap: usize,
+    /// Maximum raw capacity value
+    max_rcap: usize,
+    /// Does a system have little cores?
+    has_biglittle: bool,
+}
+
+fn get_capacity_source() -> Option<CapacitySource> {
     // Sources for guessing cpu_capacity under /sys/devices/system/cpu/cpuX.
     // They should be ordered from the most precise to the least precise.
     let sources = [
@@ -603,80 +603,73 @@ fn cpu_capacity_source() -> Option<(String, usize, usize)> {
 
     // Find the most precise source for cpu_capacity estimation.
     let prefix = "/sys/devices/system/cpu/cpu0";
-    let mut raw_capacity = 0;
+    let mut raw_capacity;
     let mut suffix = sources[sources.len() - 1];
-    for src in sources {
+    'outer: for src in sources {
         let path_str = [prefix, src].join("/");
         let path = Path::new(&path_str);
         raw_capacity = read_from_file(&path).unwrap_or(0_usize);
         if raw_capacity > 0 {
+            // It would be an okay source...
             suffix = src;
-            break;
+            // But double-check if the source has meaningful information.
+            let cpu_paths = glob("/sys/devices/system/cpu/cpu[0-9]*").ok()?;
+            for cpu_path in cpu_paths.filter_map(Result::ok) {
+                let raw_capacity2 = read_from_file(&cpu_path.join(suffix)).unwrap_or(0_usize);
+                if raw_capacity != raw_capacity2 {
+                    break 'outer;
+                }
+            }
+            // The source exists, but it tells that all CPUs have the same
+            // capacity. Let's search more if there is any source that can
+            // tell the capacity differences among CPUs. This can happen when
+            // a buggy driver lies (e.g., "acpi_cppc/highest_perf").
         }
-    }
-    if raw_capacity == 0 {
-        return None;
     }
 
     // Find the max raw_capacity value for scaling to 1024.
-    let mut max_raw_capacity = 0;
-    let mut avg_raw_capacity = 0;
+    let mut max_rcap = 0;
+    let mut min_rcap = usize::MAX;
+    let mut avg_rcap = 0;
     let mut nr_cpus = 0;
+    let mut has_biglittle = false;
     let cpu_paths = glob("/sys/devices/system/cpu/cpu[0-9]*").ok()?;
     for cpu_path in cpu_paths.filter_map(Result::ok) {
-        let raw_capacity = read_from_file(&cpu_path.join(suffix)).unwrap_or(0_usize);
-        if max_raw_capacity < raw_capacity {
-            max_raw_capacity = raw_capacity;
+        let rcap = read_from_file(&cpu_path.join(suffix)).unwrap_or(0_usize);
+        if max_rcap < rcap {
+            max_rcap = rcap;
         }
-        avg_raw_capacity += raw_capacity;
+        if min_rcap > rcap {
+            min_rcap = rcap;
+        }
+        avg_rcap += rcap;
         nr_cpus += 1;
     }
-    if max_raw_capacity == 0 {
-        return None;
+
+    if nr_cpus == 0 || max_rcap == 0 {
+        suffix = "";
+        avg_rcap = 1024;
+        max_rcap = 1024;
+        warn!("CPU capacity information is not available under sysfs.");
+    } else {
+        avg_rcap /= nr_cpus;
+        // We consider a system to have a heterogeneous CPU architecture only
+        // when there is a significant capacity gap (e.g., 1.3x). CPU capacities
+        // can still vary in a homogeneous architecture—for instance, due to
+        // chip binning or when only a subset of CPUs supports turbo boost.
+        //
+        // Note that we need a more systematic approach to accurately detect
+        // big/LITTLE architectures across various SoC designs. The current
+        // approach, with a significant capacity difference, is somewhat ad-hoc.
+        has_biglittle = max_rcap as f32 >= (1.3 * min_rcap as f32);
     }
 
-    Some((
-        suffix.to_string(),
-        avg_raw_capacity / nr_cpus,
-        max_raw_capacity,
-    ))
-}
-
-// Return the average base frequency across all CPUs and the highest maximum frequency.
-fn avg_cpu_freq() -> Option<(usize, usize)> {
-    let mut top_max_freq = 0;
-    let mut avg_base_freq = 0;
-    let mut nr_cpus = 0;
-    let cpu_paths = glob("/sys/devices/system/cpu/cpu[0-9]*").ok()?;
-    for cpu_path in cpu_paths.filter_map(Result::ok) {
-        let freq_path = cpu_path.join("cpufreq");
-        let max_freq = read_from_file(&freq_path.join("scaling_max_freq")).unwrap_or(0_usize);
-        let base_freq = read_from_file(&freq_path.join("base_frequency")).unwrap_or(max_freq);
-        if base_freq > 0 {
-            if max_freq > top_max_freq {
-                top_max_freq = max_freq;
-            }
-            avg_base_freq += base_freq;
-            nr_cpus += 1;
-        }
-    }
-    if avg_base_freq == 0 {
-        return None;
-    }
-    Some((avg_base_freq / nr_cpus, top_max_freq))
-}
-
-fn has_big_little() -> Option<bool> {
-    let mut clusters = std::collections::HashSet::new();
-
-    let cpu_paths = glob("/sys/devices/system/cpu/cpu[0-9]*").ok()?;
-    for cpu_path in cpu_paths.filter_map(Result::ok) {
-        let top_path = cpu_path.join("topology");
-        let cluster_id = read_from_file(&top_path.join("cluster_id")).unwrap_or(-1);
-        clusters.insert(cluster_id);
-    }
-
-    Some(clusters.len() > 1)
+    Some(CapacitySource {
+        suffix: suffix.to_string(),
+        avg_rcap,
+        max_rcap,
+        has_biglittle,
+    })
 }
 
 fn is_smt_active() -> Option<bool> {
@@ -716,21 +709,10 @@ fn create_default_node(
         bail!("/sys/devices/system/cpu sysfs node not found");
     }
 
-    let capacity_src = cpu_capacity_source();
-    let avg_cpu_freq = avg_cpu_freq();
-    let big_little = has_big_little().unwrap_or(false);
+    let cs = get_capacity_source().unwrap();
     let cpu_ids = read_cpu_ids()?;
     for cpu_id in cpu_ids.iter() {
-        create_insert_cpu(
-            *cpu_id,
-            &mut node,
-            online_mask,
-            topo_ctx,
-            big_little,
-            avg_cpu_freq,
-            capacity_src.clone(),
-            flatten_llc,
-        )?;
+        create_insert_cpu(*cpu_id, &mut node, online_mask, topo_ctx, &cs, flatten_llc)?;
     }
 
     nodes.insert(node.id, node);
@@ -787,9 +769,7 @@ fn create_numa_nodes(
 
         let cpu_pattern = numa_path.join("cpu[0-9]*");
         let cpu_paths = glob(cpu_pattern.to_string_lossy().as_ref())?;
-        let big_little = has_big_little().unwrap_or(false);
-        let capacity_src = cpu_capacity_source();
-        let avg_cpu_freq = avg_cpu_freq();
+        let cs = get_capacity_source().unwrap();
         let mut cpu_ids = vec![];
         for cpu_path in cpu_paths.filter_map(Result::ok) {
             let cpu_str = cpu_path.to_str().unwrap().trim();
@@ -804,16 +784,7 @@ fn create_numa_nodes(
         cpu_ids.sort();
 
         for cpu_id in cpu_ids {
-            create_insert_cpu(
-                cpu_id,
-                &mut node,
-                online_mask,
-                topo_ctx,
-                big_little,
-                avg_cpu_freq,
-                capacity_src.clone(),
-                false,
-            )?;
+            create_insert_cpu(cpu_id, &mut node, online_mask, topo_ctx, &cs, false)?;
         }
 
         nodes.insert(node.id, node);

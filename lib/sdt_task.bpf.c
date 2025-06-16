@@ -39,6 +39,8 @@ void __arena *scx_task_alloc(struct task_struct *p)
 		return NULL;
 
 	data = scx_alloc(&scx_task_allocator);
+	if (unlikely(!data))
+		return NULL;
 
 	mval->tid = data->tid;
 	mval->tptr = (__u64) p;
@@ -82,6 +84,5 @@ void scx_task_free(struct task_struct *p)
 		return;
 
 	scx_alloc_free_idx(&scx_task_allocator, mval->tid.idx);
-	mval->data = NULL;
-	mval->tptr = 0;
+	bpf_task_storage_delete(&scx_task_map, p);
 }

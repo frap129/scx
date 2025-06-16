@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -48,8 +49,10 @@ def run_format():
     """Format all targets."""
     print("Running format...", flush=True)
 
-    run_command(["black", ".github/include/ci.py"])
-    run_command(["isort", ".github/include/ci.py"])
+    py_files = glob.glob(".github/include/**/*.py", recursive=True)
+    if py_files:
+        run_command(["black"] + py_files)
+        run_command(["isort"] + py_files)
 
     run_command(["cargo", "fmt"])
 
@@ -66,7 +69,7 @@ def run_build():
     """Build all targets."""
     print("Running build...", flush=True)
 
-    run_command(["cargo", "build", "--all-targets"])
+    run_command(["cargo", "build", "--all-targets", "--locked"])
     print("✓ Build completed successfully", flush=True)
 
 
@@ -103,7 +106,11 @@ def run_tests():
     cpu_count = min(os.cpu_count(), 16)
 
     # Find kernel image
-    kernel_path = "linux/arch/x86/boot/bzImage"
+    kernel_path = os.environ.get("KERNEL_STORE_PATH")
+    if kernel_path is None:
+        kernel_path = "linux/arch/x86/boot/bzImage"
+    else:
+        kernel_path += "/bzImage"
     if not os.path.exists(kernel_path):
         print(f"Error: Kernel image not found at {kernel_path}")
         print("Make sure to run the build-kernel job first")

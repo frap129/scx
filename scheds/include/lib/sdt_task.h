@@ -24,7 +24,7 @@ enum sdt_consts {
 	SDT_TASK_CHUNK_BITMAP_U64S	= div_round_up(SDT_TASK_ENTS_PER_CHUNK, 64),
 	SDT_TASK_ALLOC_STACK_MIN	= 2 * SDT_TASK_LEVELS,
 	SDT_TASK_ALLOC_STACK_MAX	= SDT_TASK_ALLOC_STACK_MIN * 5,
-	SDT_TASK_MIN_ELEM_PER_ALLOC = 8,
+	SDT_TASK_MIN_ELEM_PER_ALLOC 	= 8,
 	SDT_TASK_ALLOC_ATTEMPTS		= 32,
 };
 
@@ -175,7 +175,7 @@ typedef struct scx_buddy_header __arena scx_buddy_header_t;
 enum scx_buddy_consts {
 	SCX_BUDDY_MIN_ALLOC_SHIFT	= 4,
 	SCX_BUDDY_MIN_ALLOC_BYTES	= 1 << SCX_BUDDY_MIN_ALLOC_SHIFT,
-	SCX_BUDDY_CHUNK_MAX_ORDER		= 16,
+	SCX_BUDDY_CHUNK_MAX_ORDER	= 16,
 	SCX_BUDDY_CHUNK_PAGES		= (SCX_BUDDY_MIN_ALLOC_BYTES << SCX_BUDDY_CHUNK_MAX_ORDER) / PAGE_SIZE,
 	SCX_BUDDY_CHUNK_ITEMS		= SCX_BUDDY_CHUNK_PAGES * PAGE_SIZE / SCX_BUDDY_MIN_ALLOC_BYTES,
 	SCX_BUDDY_CHUNK_OFFSET_MASK	= (SCX_BUDDY_CHUNK_PAGES * PAGE_SIZE) - 1,
@@ -210,5 +210,43 @@ int scx_buddy_init(struct scx_buddy *buddy, size_t size);
 void scx_buddy_free(struct scx_buddy *buddy, size_t free);
 u64 scx_buddy_alloc_internal(struct scx_buddy *buddy, size_t size);
 #define scx_buddy_alloc(alloc) ((void __arena *)scx_buddy_alloc_internal((buddy, size)))
+
+static inline
+int scx_ffs(__u64 word)
+{
+	unsigned int num = 0;
+
+	if ((word & 0xffffffff) == 0) {
+		num += 32;
+		word >>= 32;
+	}
+
+	if ((word & 0xffff) == 0) {
+		num += 16;
+		word >>= 16;
+	}
+
+	if ((word & 0xff) == 0) {
+		num += 8;
+		word >>= 8;
+	}
+
+	if ((word & 0xf) == 0) {
+		num += 4;
+		word >>= 4;
+	}
+
+	if ((word & 0x3) == 0) {
+		num += 2;
+		word >>= 2;
+	}
+
+	if ((word & 0x1) == 0) {
+		num += 1;
+		word >>= 1;
+	}
+
+	return num;
+}
 
 #endif /* __BPF__ */

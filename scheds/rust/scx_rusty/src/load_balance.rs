@@ -506,11 +506,10 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
     }
 
     pub fn get_stats(&self) -> BTreeMap<usize, NodeStats> {
-        let mut stats = BTreeMap::new();
-        for node in self.nodes.iter() {
-            stats.insert(node.id, node.stats());
-        }
-        stats
+        self.nodes
+            .iter()
+            .map(|node| (node.id, node.stats()))
+            .collect()
     }
 
     fn create_domain_hierarchy(&mut self) -> Result<()> {
@@ -690,10 +689,7 @@ impl<'a, 'b> LoadBalancer<'a, 'b> {
     where
         I: IntoIterator<Item = &'d TaskInfo>,
     {
-        match tasks_by_load.into_iter().next() {
-            Some(task) => Some(task),
-            None => None,
-        }
+        tasks_by_load.into_iter().next()
     }
 
     /// Try to find a task in @push_dom to be moved into @pull_dom. If a task is

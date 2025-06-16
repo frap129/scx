@@ -6,14 +6,14 @@ on:
     - cron: "35 0,6,12,18 * * *"
 
 jobs:
-  build-kernel:
-    uses: ./.github/workflows/build-kernel.yml
-    with:
-      repo-name: bpf/bpf-next
+  build-kernels:
+    uses: ./.github/workflows/build-kernels.yml
+    secrets: inherit
 
   integration-test:
     uses: ./.github/workflows/integration-tests.yml
-    needs: build-kernel
+    needs: build-kernels
+    secrets: inherit
     with:
       repo-name: bpf/bpf-next
 

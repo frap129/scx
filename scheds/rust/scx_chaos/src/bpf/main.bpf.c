@@ -39,14 +39,19 @@ const volatile u64 chaos_timer_check_queues_min_ns = 500000;
 const volatile u64 chaos_timer_check_queues_max_ns = 2000000;
 const volatile u64 chaos_timer_check_queues_slack_ns = 2500000;
 
-const volatile u32 random_delays_freq_frac32 = 1; /* for veristat */
+const volatile u32 trait_delay_freq_frac32[CHAOS_TRAIT_MAX];
+
 const volatile u64 random_delays_min_ns = 1; /* for veristat */
 const volatile u64 random_delays_max_ns = 2; /* for veristat */
 
+const volatile u32 cpu_freq_min = 0;
+const volatile u32 cpu_freq_max = SCX_CPUPERF_ONE;
+
+const volatile u32 degradation_freq_frac32 = 1;
+const volatile u64 degradation_frac7 = 0;
+
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
-
-#define MAX_ITERS_IN_DISPATCH 8
 
 enum chaos_timer_callbacks {
 	CHAOS_TIMER_CHECK_QUEUES,
@@ -67,20 +72,49 @@ struct {
 	__type(value, struct chaos_task_ctx);
 } chaos_task_ctxs SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, CHAOS_NR_STATS);
+	__type(key, u32);
+	__type(value, u64);
+} chaos_stats SEC(".maps");
+
 struct chaos_task_ctx *lookup_create_chaos_task_ctx(struct task_struct *p)
 {
 	return bpf_task_storage_get(&chaos_task_ctxs, p, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
 
+static __always_inline void chaos_stat_inc(enum chaos_stat_idx stat)
+{
+	u64 *cnt_p = bpf_map_lookup_elem(&chaos_stats, &stat);
+	if (cnt_p)
+		(*cnt_p)++;
+}
+
 static __always_inline enum chaos_trait_kind choose_chaos(struct chaos_task_ctx *taskc)
 {
-	if (taskc->match & CHAOS_MATCH_EXCLUDED)
+	if (taskc->match & CHAOS_MATCH_EXCLUDED) {
+		chaos_stat_inc(CHAOS_STAT_CHAOS_EXCLUDED);
 		return CHAOS_TRAIT_NONE;
+	}
 
-	if (bpf_get_prandom_u32() < random_delays_freq_frac32)
-		return CHAOS_TRAIT_RANDOM_DELAYS;
+	u32 roll = bpf_get_prandom_u32();
 
-	return CHAOS_TRAIT_NONE;
+	#pragma unroll
+	for (int i = 0; i < CHAOS_TRAIT_MAX; ++i) {
+		if (roll <= trait_delay_freq_frac32[i])
+			return i;
+	}
+
+	scx_bpf_error("failed to select trait in choose_chaos");
+	return -1;
+}
+
+static __always_inline bool chaos_trait_skips_select_cpu(struct chaos_task_ctx *taskc)
+{
+	if (taskc->next_trait == CHAOS_TRAIT_RANDOM_DELAYS)
+		return true;
+	return false;
 }
 
 static __always_inline u64 get_cpu_delay_dsq(int cpu_idx)
@@ -227,6 +261,7 @@ __weak s32 enqueue_random_delay(struct task_struct *p __arg_trusted, u64 enq_fla
 	}
 
 	scx_bpf_dsq_insert_vtime(p, get_cpu_delay_dsq(-1), 0, vtime, enq_flags);
+	chaos_stat_inc(CHAOS_STAT_TRAIT_RANDOM_DELAYS);
 
 	return true;
 }
@@ -242,6 +277,11 @@ __weak s32 enqueue_chaotic(struct task_struct *p __arg_trusted, u64 enq_flags,
 		break;
 
 	case CHAOS_TRAIT_NONE:
+		chaos_stat_inc(CHAOS_STAT_CHAOS_SKIPPED);
+		out = false;
+		break;
+	case CHAOS_TRAIT_CPU_FREQ:
+	case CHAOS_TRAIT_DEGRADATION:
 	case CHAOS_TRAIT_MAX:
 		out = false;
 		break;
@@ -263,7 +303,6 @@ __weak u64 check_dsq_times(int cpu_idx)
 	struct task_struct *p;
 	u64 next_trigger_time = 0;
 	u64 now = bpf_ktime_get_ns();
-	int i = 0;
 	bool has_kicked = false;
 
 	bpf_rcu_read_lock();
@@ -272,26 +311,21 @@ __weak u64 check_dsq_times(int cpu_idx)
 		if (!p)
 			break;
 
-		if (i++ >= MAX_ITERS_IN_DISPATCH) {
-			next_trigger_time = p->scx.dsq_vtime;
-			bpf_task_release(p);
-			break;
-		}
-
-		if (has_kicked) {
-			bpf_task_release(p);
-			continue;
-		}
-
-		if (p->scx.dsq_vtime < now + chaos_timer_check_queues_slack_ns) {
+		if (!has_kicked && p->scx.dsq_vtime < now - chaos_timer_check_queues_slack_ns) {
 			has_kicked = true;
 			scx_bpf_kick_cpu(cpu_idx, SCX_KICK_PREEMPT);
-		} else if (p->scx.dsq_vtime < now) {
+			chaos_stat_inc(CHAOS_STAT_TIMER_KICKS);
+		} else if (!has_kicked && p->scx.dsq_vtime < now) {
 			has_kicked = true;
 			scx_bpf_kick_cpu(cpu_idx, SCX_KICK_IDLE);
+			chaos_stat_inc(CHAOS_STAT_TIMER_KICKS);
+		} else if (p->scx.dsq_vtime > now) {
+			next_trigger_time = p->scx.dsq_vtime;
 		}
 
 		bpf_task_release(p);
+		if (next_trigger_time > now + chaos_timer_check_queues_slack_ns)
+			break;
 	}
 	bpf_rcu_read_unlock();
 
@@ -384,6 +418,14 @@ out:
 	pro->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 }
 
+__weak int async_p2dq_enqueue_weak(struct enqueue_promise *ret __arg_nonnull,
+				   struct task_struct *p __arg_trusted,
+				   u64 enq_flags)
+{
+	async_p2dq_enqueue(ret, p, enq_flags);
+	return 0;
+}
+
 void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct enqueue_promise promise;
@@ -391,11 +433,7 @@ void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
 	struct task_struct *p;
 	u64 now = bpf_ktime_get_ns();
 
-	int i = 0;
 	bpf_for_each(scx_dsq, p, get_cpu_delay_dsq(-1), 0) {
-		if (i++ >= MAX_ITERS_IN_DISPATCH)
-			break; // the verifier can't handle this loop, so limit it
-
 		p = bpf_task_from_pid(p->pid);
 		if (!p)
 			continue;
@@ -414,7 +452,7 @@ void BPF_STRUCT_OPS(chaos_dispatch, s32 cpu, struct task_struct *prev)
 		// restore vtime to p2dq's timeline
 		p->scx.dsq_vtime = taskc->p2dq_vtime;
 
-		async_p2dq_enqueue(&promise, p, taskc->enq_flags);
+		async_p2dq_enqueue_weak(&promise, p, taskc->enq_flags);
 		complete_p2dq_enqueue_move(&promise, BPF_FOR_EACH_ITER, p);
 		bpf_task_release(p);
 	}
@@ -439,11 +477,26 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	if (promise.kind == P2DQ_ENQUEUE_PROMISE_COMPLETE)
 		return;
 
-	if (taskc->next_trait == CHAOS_TRAIT_NONE)
-		return complete_p2dq_enqueue(&promise, p);
-
-	if (enqueue_chaotic(p, enq_flags, taskc))
+	if (taskc->next_trait == CHAOS_TRAIT_RANDOM_DELAYS &&
+	    enqueue_chaotic(p, enq_flags, taskc))
 		return;
+
+	// NOTE: this may not work for affinitized tasks because p2dq does
+	// direct dispatch in some situations.
+	if (taskc->next_trait == CHAOS_TRAIT_DEGRADATION) {
+		if (promise.kind == P2DQ_ENQUEUE_PROMISE_FIFO) {
+			promise.fifo.slice_ns = ((degradation_frac7 << 7) * promise.fifo.slice_ns) >> 7;
+			dbg("CHAOS[degradation][%d] slice_ns: %llu", p, promise.fifo.slice_ns);
+			chaos_stat_inc(CHAOS_STAT_TRAIT_DEGRADATION);
+		}
+		if (promise.kind == P2DQ_ENQUEUE_PROMISE_VTIME) {
+			promise.vtime.vtime += ((degradation_frac7 << 7) * promise.vtime.slice_ns) >> 7;
+			promise.vtime.slice_ns = ((degradation_frac7 << 7) * promise.vtime.slice_ns) >> 7;
+			dbg("CHAOS[degradation][%d] vtime: %llu slice_ns: %llu",
+			    p, promise.vtime.vtime, promise.vtime.slice_ns);
+			chaos_stat_inc(CHAOS_STAT_TRAIT_DEGRADATION);
+		}
+	}
 
 	complete_p2dq_enqueue(&promise, p);
 }
@@ -452,15 +505,39 @@ void BPF_STRUCT_OPS(chaos_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct chaos_task_ctx *wakee_ctx;
 	if (!(wakee_ctx = lookup_create_chaos_task_ctx(p)))
-		goto p2dq;
+		return;
 
 	enum chaos_trait_kind t = choose_chaos(wakee_ctx);
 	if (t == CHAOS_TRAIT_NONE)
-		goto p2dq;
+		return;
 
 	wakee_ctx->next_trait = t;
-p2dq:
-	return p2dq_runnable_impl(p, enq_flags);
+}
+
+void BPF_STRUCT_OPS(chaos_running, struct task_struct *p)
+{
+	struct chaos_task_ctx *taskc;
+
+	if (!(taskc = lookup_create_chaos_task_ctx(p))) {
+		scx_bpf_error("failed to lookup task context in enqueue");
+		return;
+	}
+
+	// Handle frequency scaling after p2dq. If chaos frequency control is
+	// enabled then p2dq frequency control should be disabled.
+	p2dq_running_impl(p);
+
+	s32 task_cpu = scx_bpf_task_cpu(p);
+	if (taskc->next_trait == CHAOS_TRAIT_CPU_FREQ) {
+		if (cpu_freq_min > 0) {
+			dbg("CHAOS[freq][%d] freq: %d", p->pid, cpu_freq_min);
+			scx_bpf_cpuperf_set(task_cpu, cpu_freq_min);
+			chaos_stat_inc(CHAOS_STAT_TRAIT_CPU_FREQ);
+		}
+	} else {
+		if (cpu_freq_max > 0)
+			scx_bpf_cpuperf_set(task_cpu, cpu_freq_max);
+	}
 }
 
 s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -470,7 +547,7 @@ s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wa
 		goto p2dq;
 
 	// don't allow p2dq to select_cpu if we plan chaos to ensure we hit enqueue
-	if (wakee_ctx->next_trait != CHAOS_TRAIT_NONE)
+	if (chaos_trait_skips_select_cpu(wakee_ctx))
 		return prev_cpu;
 
 p2dq:
@@ -501,7 +578,7 @@ SCX_OPS_DEFINE(chaos,
 
 	       .exit_task		= (void *)p2dq_exit_task,
 	       .exit			= (void *)p2dq_exit,
-	       .running			= (void *)p2dq_running,
+	       .running			= (void *)chaos_running,
 	       .stopping		= (void *)p2dq_stopping,
 	       .set_cpumask		= (void *)p2dq_set_cpumask,
 

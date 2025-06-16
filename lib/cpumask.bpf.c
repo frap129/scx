@@ -4,137 +4,87 @@
 #include <lib/cpumask.h>
 #include <lib/percpu.h>
 
-static struct scx_allocator scx_bitmap_allocator;
-size_t mask_size;
+extern const volatile u32 nr_cpu_ids;
 
-__weak
-int scx_bitmap_init(__u64 total_mask_size)
+extern size_t mask_size;
+
+static __always_inline s32
+scx_bitmap_pick_any_cpu_once(scx_bitmap_t __arg_arena mask, u64 __arg_arena *start)
 {
-	mask_size = div_round_up(total_mask_size, 8);
+	u64 old, new;
+	u64 ind, i;
+	s32 cpu;
 
-	return scx_alloc_init(&scx_bitmap_allocator, mask_size * 8 + sizeof(union sdt_id));
-}
+	if (unlikely(mask_size < SCXMASK_NLONG))
+		return -EINVAL;
 
-__weak
-u64 scx_bitmap_alloc_internal(void)
-{
-	struct sdt_data __arena *data = NULL;
-	scx_bitmap_t mask;
-	int i;
+	bpf_for (i, 0, SCXMASK_NLONG) {
+		if (i >= mask_size)
+			break;
 
-	data = scx_alloc(&scx_bitmap_allocator);
-	if (unlikely(!data))
-		return (u64)(NULL);
+		ind = (*start + i) % mask_size;
 
-	mask = (scx_bitmap_t)data->payload;
-	mask->tid = data->tid;
-	bpf_for(i, 0, mask_size) {
-		mask->bits[i] = 0ULL;
+		old = mask->bits[ind];
+		if (!old)
+			continue;
+
+		cpu = scx_ffs(old);
+		new = old & ~(1ULL << cpu);
+		if (cmpxchg(&mask->bits[ind], old, new) != old)
+			return -EAGAIN;
+
+		*start = ind;
+
+		return ind * 64 + cpu;
 	}
 
-	return (u64)mask;
+	return -ENOSPC;
 }
 
-/*
- * XXXETSAL: Ideally these functions would have a void return type,
- * but as of 6.13 the verifier requires global functions to return a scalar.
- */
-
-__weak
-int scx_bitmap_free(scx_bitmap_t __arg_arena mask)
+__weak s32
+scx_bitmap_pick_any_cpu_from(scx_bitmap_t __arg_arena mask, u64 __arg_arena *start)
 {
-	scx_arena_subprog_init();
+	s32 cpu;
 
-	scx_alloc_free_idx(&scx_bitmap_allocator, mask->tid.idx);
-	return 0;
+	do {
+		cpu = scx_bitmap_pick_any_cpu_once(mask, start);
+	} while (cpu == -EAGAIN && can_loop);
+
+	return cpu;
 }
 
-__weak
-int scx_bitmap_copy_to_stack(struct scx_bitmap *dst, scx_bitmap_t __arg_arena src)
+__weak s32
+scx_bitmap_pick_any_cpu(scx_bitmap_t __arg_arena mask)
 {
-	int i;
+	u64 zero = 0;
+	s32 cpu;
 
-	if (unlikely(!src || !dst)) {
-		scx_bpf_error("invalid pointer args to pointer copy");
-		return 0;
+	do {
+		cpu = scx_bitmap_pick_any_cpu_once(mask, &zero);
+	} while (cpu == -EAGAIN && can_loop);
+
+	return cpu;
+}
+
+__weak s32
+scx_bitmap_vacate_cpu(scx_bitmap_t __arg_arena mask, s32 cpu)
+{
+	int off = (u32)cpu / 64;
+	int ind = (u32)cpu % 64;
+
+	if (cpu < 0 || cpu >= nr_cpu_ids) {
+		bpf_printk("freeing invalid cpu");
+		return -EINVAL;
 	}
 
-	bpf_for(i, 0, mask_size) {
-		if (i >= SCXMASK_NLONG || i < 0)
-			return 0;
-		dst->bits[i] = src->bits[i];
+	if (off < 0 || off >= mask_size || off >= SCXMASK_NLONG) {
+		bpf_printk("impossible out-of-bounds on free");
+		return -EINVAL;
 	}
 
-	return 0;
-}
-
-__weak
-int scx_bitmap_set_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
-{
-	mask->bits[cpu / 64] |= 1 << (cpu % 64);
-	return 0;
-}
-
-__weak
-int scx_bitmap_clear_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
-{
-	mask->bits[cpu / 64] &= 1 << ~(cpu % 64);
-	return 0;
-}
-
-__weak
-bool scx_bitmap_test_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
-{
-	return mask->bits[cpu / 64] & (1 << (cpu % 64));
-}
-
-__weak
-int scx_bitmap_clear(scx_bitmap_t __arg_arena mask)
-{
-	int i;
-
-	bpf_for(i, 0, mask_size) {
-		mask->bits[i] = 0;
-	}
+	__sync_fetch_and_or(&mask->bits[off], 1 << ind);
 
 	return 0;
-}
-
-__weak
-int scx_bitmap_and(scx_bitmap_t __arg_arena dst, scx_bitmap_t __arg_arena src1, scx_bitmap_t __arg_arena src2)
-{
-	int i;
-
-	bpf_for(i, 0, mask_size) {
-		dst->bits[i] = src1->bits[i] & src2->bits[i];
-	}
-
-	return 0;
-}
-
-__weak
-int scx_bitmap_or(scx_bitmap_t __arg_arena dst, scx_bitmap_t __arg_arena src1, scx_bitmap_t __arg_arena src2)
-{
-	int i;
-
-	bpf_for(i, 0, mask_size) {
-		dst->bits[i] = src1->bits[i] | src2->bits[i];
-	}
-
-	return 0;
-}
-
-__weak
-bool scx_bitmap_empty(scx_bitmap_t __arg_arena mask)
-{
-	int i;
-
-	bpf_for(i, 0, mask_size) {
-		if (mask->bits[i])
-			return true;
-	}
-
-	return true;
 }
 
 __weak int
@@ -147,35 +97,10 @@ scx_bitmap_to_bpf(struct bpf_cpumask __kptr *bpfmask __arg_trusted,
 	tmp = scx_percpu_scx_bitmap_stack();
 	scx_bitmap_copy_to_stack(tmp, scx_bitmap);
 
-	ret = bpf_cpumask_populate((struct cpumask *)bpfmask, tmp->bits, sizeof(tmp->bits));
-	if (unlikely(ret))
-		scx_bpf_error("error %d when calling bpf_cpumask_populate", ret);
-
-	return 0;
-}
-
-
-__weak
-int scx_bitmap_copy(scx_bitmap_t __arg_arena dst, scx_bitmap_t __arg_arena src)
-{
-	int i;
-
-	bpf_for(i, 0, mask_size) {
-		dst->bits[i] = src->bits[i];
-	}
-
-	return 0;
-}
-
-__weak int
-scx_bitmap_from_bpf(scx_bitmap_t __arg_arena scx_bitmap, const cpumask_t *bpfmask __arg_trusted)
-{
-	int i;
-
-	for (i = 0; i < sizeof(cpumask_t) / 8 && can_loop; i++) {
-		if (i >= mask_size)
-			break;
-		scx_bitmap->bits[i] = bpfmask->bits[i];
+	ret = __COMPAT_bpf_cpumask_populate((struct cpumask *)bpfmask, tmp->bits, sizeof(tmp->bits));
+	if (unlikely(ret)) {
+		bpf_printk("error %d when calling bpf_cpumask_populate", ret);
+		return ret;
 	}
 
 	return 0;
@@ -185,32 +110,20 @@ __weak
 bool scx_bitmap_subset_cpumask(scx_bitmap_t __arg_arena big, const struct cpumask *small __arg_trusted)
 {
 	scx_bitmap_t tmp = scx_percpu_scx_bitmap();
-	int i;
 
 	scx_bitmap_from_bpf(tmp, small);
 
-	bpf_for(i, 0, mask_size) {
-		if (~big->bits[i] & tmp->bits[i])
-			return false;
-	}
-
-	return true;
+	return scx_bitmap_subset(big, tmp);
 }
 
 __weak
 bool scx_bitmap_intersects_cpumask(scx_bitmap_t __arg_arena scx, const struct cpumask *bpf __arg_trusted)
 {
 	scx_bitmap_t tmp = scx_percpu_scx_bitmap();
-	int i;
 
 	scx_bitmap_from_bpf(tmp, bpf);
 
-	bpf_for(i, 0, mask_size) {
-		if (scx->bits[i] & tmp->bits[i])
-			return true;
-	}
-
-	return false;
+	return scx_bitmap_intersects(scx, tmp);
 }
 
 __weak
@@ -225,4 +138,51 @@ int scx_bitmap_and_cpumask(scx_bitmap_t dst __arg_arena,
 	scx_bitmap_and(dst, scx, tmp);
 
 	return 0;
+}
+
+__weak
+s32 scx_bitmap_pick_idle_cpu(scx_bitmap_t mask __arg_arena, int flags)
+{
+	struct bpf_cpumask __kptr *bpf = scx_percpu_bpfmask();
+	s32 cpu;
+
+	if (!bpf)
+		return -1;
+
+	scx_bitmap_to_bpf(bpf, mask);
+	cpu = scx_bpf_pick_idle_cpu(cast_mask(bpf), flags);
+
+	scx_bitmap_from_bpf(mask, cast_mask(bpf));
+
+	return cpu;
+}
+
+__weak
+s32 scx_bitmap_any_distribute(scx_bitmap_t mask __arg_arena)
+{
+	struct bpf_cpumask __kptr *bpf = scx_percpu_bpfmask();
+	s32 cpu;
+
+	if (!bpf)
+		return -1;
+
+	scx_bitmap_to_bpf(bpf, mask);
+	cpu = bpf_cpumask_any_distribute(cast_mask(bpf));
+
+	return cpu;
+}
+
+__weak
+s32 scx_bitmap_any_and_distribute(scx_bitmap_t scx __arg_arena, const struct cpumask *bpf)
+{
+	struct bpf_cpumask *tmp = scx_percpu_bpfmask();
+	s32 cpu;
+
+	if (!bpf || !tmp)
+		return -1;
+
+	scx_bitmap_to_bpf(tmp, scx);
+	cpu = bpf_cpumask_any_and_distribute(cast_mask(tmp), bpf);
+
+	return cpu;
 }

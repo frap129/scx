@@ -1,7 +1,7 @@
 use crate::StatsClient;
 use crate::{Meta, StatsData, StatsKind, StatsMeta};
 use anyhow::{anyhow, bail, Context, Result};
-use crossbeam::channel::{unbounded, Receiver, RecvError, Select, SendError, Sender};
+use crossbeam::channel::{unbounded, Receiver, RecvError, Select, Sender};
 use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -522,9 +522,8 @@ where
                             }
                         };
 
-                        match inner_ch.req.send(req) {
-                            Ok(()) => {}
-                            Err(SendError(..)) => break 'outer,
+                        if inner_ch.req.send(req).is_err() {
+                            break 'outer;
                         }
 
                         let resp = match inner_ch.res.recv() {
@@ -532,12 +531,9 @@ where
                             Err(RecvError) => break 'outer,
                         };
 
-                        match pair.req.send(resp) {
-                            Ok(()) => {}
-                            Err(SendError(..)) => {
-                                idx_to_drop = Some(*idx);
-                                break 'select;
-                            }
+                        if pair.req.send(resp).is_err() {
+                            idx_to_drop = Some(*idx);
+                            break 'select;
                         }
                     }
                 }
@@ -564,16 +560,16 @@ where
                     let (req_pair, res_pair) = ChannelPair::<Req, Res>::bidi();
                     match add_req.send(res_pair) {
                         Ok(()) => debug!("sent new channel to proxy"),
-                        Err(e) => warn!("StatsServer::proxy() failed ({})", &e),
+                        Err(e) => warn!("StatsServer::proxy() failed ({})", e),
                     }
 
                     spawn(move || {
                         if let Err(e) = Self::serve(stream, data, req_pair, exit) {
-                            warn!("stat communication errored ({})", &e);
+                            warn!("stat communication errored ({})", e);
                         }
                     });
                 }
-                Err(e) => warn!("failed to accept stat connection ({})", &e),
+                Err(e) => warn!("failed to accept stat connection ({})", e),
             }
         }
     }

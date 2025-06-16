@@ -38,12 +38,17 @@ const GSTAT_LO_FB_EVENTS: usize = bpf_intf::global_stat_id_GSTAT_LO_FB_EVENTS as
 const GSTAT_LO_FB_USAGE: usize = bpf_intf::global_stat_id_GSTAT_LO_FB_USAGE as usize;
 const GSTAT_FB_CPU_USAGE: usize = bpf_intf::global_stat_id_GSTAT_FB_CPU_USAGE as usize;
 const GSTAT_ANTISTALL: usize = bpf_intf::global_stat_id_GSTAT_ANTISTALL as usize;
+const GSTAT_SKIP_PREEMPT: usize = bpf_intf::global_stat_id_GSTAT_SKIP_PREEMPT as usize;
+const GSTAT_FIXUP_VTIME: usize = bpf_intf::global_stat_id_GSTAT_FIXUP_VTIME as usize;
+const GSTAT_PREEMPTING_MISMATCH: usize =
+    bpf_intf::global_stat_id_GSTAT_PREEMPTING_MISMATCH as usize;
 
 const LSTAT_SEL_LOCAL: usize = bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL as usize;
 const LSTAT_ENQ_LOCAL: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_LOCAL as usize;
 const LSTAT_ENQ_WAKEUP: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_WAKEUP as usize;
 const LSTAT_ENQ_EXPIRE: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_EXPIRE as usize;
 const LSTAT_ENQ_REENQ: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_REENQ as usize;
+const LSTAT_ENQ_DSQ: usize = bpf_intf::layer_stat_id_LSTAT_ENQ_DSQ as usize;
 const LSTAT_MIN_EXEC: usize = bpf_intf::layer_stat_id_LSTAT_MIN_EXEC as usize;
 const LSTAT_MIN_EXEC_NS: usize = bpf_intf::layer_stat_id_LSTAT_MIN_EXEC_NS as usize;
 const LSTAT_OPEN_IDLE: usize = bpf_intf::layer_stat_id_LSTAT_OPEN_IDLE as usize;
@@ -132,6 +137,8 @@ pub struct LayerStats {
     pub enq_expire: f64,
     #[stat(desc = "% re-enqueued due to RT preemption")]
     pub enq_reenq: f64,
+    #[stat(desc = "% enqueued into the layer's LLC DSQs")]
+    pub enq_dsq: f64,
     #[stat(desc = "count of times exec duration < min_exec_us")]
     pub min_exec: f64,
     #[stat(desc = "total exec durations extended due to min_exec_us")]
@@ -252,6 +259,7 @@ impl LayerStats {
             enq_wakeup: lstat_pct(LSTAT_ENQ_WAKEUP),
             enq_expire: lstat_pct(LSTAT_ENQ_EXPIRE),
             enq_reenq: lstat_pct(LSTAT_ENQ_REENQ),
+            enq_dsq: lstat_pct(LSTAT_ENQ_DSQ),
             min_exec: lstat_pct(LSTAT_MIN_EXEC),
             min_exec_us: (lstat(LSTAT_MIN_EXEC_NS) / 1000) as u64,
             open_idle: lstat_pct(LSTAT_OPEN_IDLE),
@@ -319,11 +327,12 @@ impl LayerStats {
 
         writeln!(
             w,
-            "  {:<width$}  tot={:7} local_sel/enq={}/{} wake/exp/reenq={}/{}/{}",
+            "  {:<width$}  tot={:7} local_sel/enq={}/{} enq_dsq={} wake/exp/reenq={}/{}/{}",
             "",
             self.total,
             fmt_pct(self.sel_local),
             fmt_pct(self.enq_local),
+            fmt_pct(self.enq_dsq),
             fmt_pct(self.enq_wakeup),
             fmt_pct(self.enq_expire),
             fmt_pct(self.enq_reenq),
@@ -493,6 +502,12 @@ pub struct SysStats {
     pub lo_fb_util: f64,
     #[stat(desc = "Number of tasks dispatched via antistall")]
     pub antistall: u64,
+    #[stat(desc = "Number of times preemptions of non-scx tasks were avoided")]
+    pub skip_preempt: u64,
+    #[stat(desc = "Number of times vtime was out of range and fixed up")]
+    pub fixup_vtime: u64,
+    #[stat(desc = "Number of times cpuc->preempting_task didn't come on the CPU")]
+    pub preempting_mismatch: u64,
     #[stat(desc = "fallback CPU")]
     pub fallback_cpu: u32,
     #[stat(desc = "per-layer statistics")]
@@ -548,6 +563,9 @@ impl SysStats {
             lo_fb_util: stats.bpf_stats.gstats[GSTAT_LO_FB_USAGE] as f64 / elapsed_ns as f64
                 * 100.0,
             antistall: stats.bpf_stats.gstats[GSTAT_ANTISTALL],
+            skip_preempt: stats.bpf_stats.gstats[GSTAT_SKIP_PREEMPT],
+            fixup_vtime: stats.bpf_stats.gstats[GSTAT_FIXUP_VTIME],
+            preempting_mismatch: stats.bpf_stats.gstats[GSTAT_PREEMPTING_MISMATCH],
             fallback_cpu: fallback_cpu as u32,
             fallback_cpu_util: stats.bpf_stats.gstats[GSTAT_FB_CPU_USAGE] as f64
                 / elapsed_ns as f64
@@ -571,7 +589,7 @@ impl SysStats {
 
         writeln!(
             w,
-            "busy={:5.1} util/hi/lo={:7.1}/{}/{} fallback_cpu/util={:3}/{:4.1} proc={:?}ms antistall={}",
+            "busy={:5.1} util/hi/lo={:7.1}/{}/{} fallback_cpu/util={:3}/{:4.1} proc={:?}ms",
             self.busy,
             self.util,
             fmt_pct(self.hi_fb_util),
@@ -579,13 +597,18 @@ impl SysStats {
             self.fallback_cpu,
             self.fallback_cpu_util,
             self.proc_ms,
-            self.antistall,
         )?;
 
         writeln!(
             w,
             "excl_coll={:.2} excl_preempt={:.2} excl_idle={:.2} excl_wakeup={:.2}",
             self.excl_collision, self.excl_preempt, self.excl_idle, self.excl_wakeup
+        )?;
+
+        writeln!(
+            w,
+            "skip_preempt={} antistall={} fixup_vtime={} preempting_mismatch={}",
+            self.skip_preempt, self.antistall, self.fixup_vtime, self.preempting_mismatch
         )?;
 
         Ok(())
@@ -635,7 +658,7 @@ pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
         req_ch.send(StatsReq::Hello(tid))?;
         let mut stats = Some(match res_ch.recv()? {
             StatsRes::Hello(v) => v,
-            res => bail!("invalid response to Hello: {:?}", &res),
+            res => bail!("invalid response to Hello: {:?}", res),
         });
 
         let read: Box<dyn StatsReader<StatsReq, StatsRes>> =
@@ -643,7 +666,7 @@ pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
                 req_ch.send(StatsReq::Refresh(tid, stats.take().unwrap()))?;
                 let (new_stats, sys_stats) = match res_ch.recv()? {
                     StatsRes::Refreshed(v) => v,
-                    res => bail!("invalid response to Refresh: {:?}", &res),
+                    res => bail!("invalid response to Refresh: {:?}", res),
                 };
                 stats = Some(new_stats);
                 sys_stats.to_json()
@@ -656,7 +679,7 @@ pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
         req_ch.send(StatsReq::Bye(current().id())).unwrap();
         match res_ch.recv().unwrap() {
             StatsRes::Bye => {}
-            res => panic!("invalid response to Bye: {:?}", &res),
+            res => panic!("invalid response to Bye: {:?}", res),
         }
     });
 
